@@ -1,0 +1,69 @@
+name: update-prod-manifest
+on:
+  workflow_call:
+    inputs:
+      image_tag:
+        required: true
+        type: string
+      manifest_path:
+        required: false
+        type: string
+        default: manifests/prod/kustomization.yaml
+      image_name:
+        required: false
+        type: string
+        default: ''
+        description: "If set, scopes the bump to the kustomize images entry with this .name. Required for multi-image manifests."
+
+permissions:
+  contents: write
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref }}
+
+      - env:
+          IMAGE_TAG: ${{ inputs.image_tag }}
+          IMAGE_NAME: ${{ inputs.image_name }}
+          MANIFEST: ${{ inputs.manifest_path }}
+          BRANCH: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          if [ -n "$IMAGE_NAME" ]; then
+            CURRENT=$(yq -r "(.images[] | select(.name == \"$IMAGE_NAME\") | .newTag) // \"\"" "$MANIFEST")
+            if [ "$CURRENT" = "$IMAGE_TAG" ]; then
+              echo "Manifest already at $IMAGE_TAG for $IMAGE_NAME, nothing to do."; exit 0
+            fi
+            yq -i "(.images[] | select(.name == \"$IMAGE_NAME\") | .newTag) = \"$IMAGE_TAG\"" "$MANIFEST"
+          else
+            # Legacy single-image path: unscoped sed. Do not use for multi-image manifests.
+            if grep -q "newTag: $IMAGE_TAG" "$MANIFEST"; then
+              echo "Manifest already at $IMAGE_TAG, nothing to do."; exit 0
+            fi
+            sed -i "s|newTag: .*|newTag: $IMAGE_TAG|" "$MANIFEST"
+          fi
+
+          git config user.email "manifest-bot@logiskbrist.no"
+          git config user.name "manifest-bot"
+          git add "$MANIFEST"
+          MSG="bump prod image${IMAGE_NAME:+ $IMAGE_NAME} to $IMAGE_TAG [skip ci]"
+          git commit -m "$MSG"
+
+          # Retry on race with a concurrent bump job (e.g. multi-service caller
+          # without max-parallel: 1). Rebase resolves cleanly when the peer
+          # bumped a different image line in the same file.
+          attempts=0
+          until git push origin "HEAD:$BRANCH"; do
+            attempts=$((attempts + 1))
+            if [ $attempts -ge 3 ]; then
+              echo "::error::push to $BRANCH failed after 3 attempts"
+              exit 1
+            fi
+            echo "push rejected, rebasing and retrying (attempt $attempts)..."
+            git pull --rebase origin "$BRANCH"
+          done

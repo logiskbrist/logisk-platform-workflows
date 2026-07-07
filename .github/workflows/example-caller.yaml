@@ -1,0 +1,32 @@
+# NOT a reusable workflow. This is a copy-paste template of what a customer app repo
+# needs at .github/workflows/build.yaml (or similar) to consume the reusable workflows
+# in this repo.
+name: build
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build:
+    uses: PLACEHOLDER_CUSTOMERORG/logisk-platform-workflows/.github/workflows/build-and-push.yaml@v1
+
+  open-draft-pr:
+    # Only fires on non-main branch pushes. Idempotent — no-op if PR exists.
+    if: github.event_name == 'push' && github.ref != 'refs/heads/main'
+    uses: PLACEHOLDER_CUSTOMERORG/logisk-platform-workflows/.github/workflows/open-draft-pr.yaml@v1
+    secrets: inherit
+
+  bump-prod:
+    needs: build
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    uses: PLACEHOLDER_CUSTOMERORG/logisk-platform-workflows/.github/workflows/update-prod-manifest.yaml@v1
+    with:
+      image_tag: ${{ needs.build.outputs.tag }}
+
+  bump-preview:
+    needs: build
+    if: github.event_name == 'pull_request' && github.event.action != 'closed'
+    uses: PLACEHOLDER_CUSTOMERORG/logisk-platform-workflows/.github/workflows/update-preview-manifest.yaml@v1
+    with:
+      image_tag: ${{ needs.build.outputs.tag }}

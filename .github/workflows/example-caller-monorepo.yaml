@@ -1,0 +1,68 @@
+# NOT a reusable workflow. Copy this file into a customer monorepo app repo at
+# .github/workflows/build.yaml. Assumes two services — web (./web) and api (./api) —
+# each with its own Dockerfile and its own entry in manifests/{prod,preview}/kustomization.yaml.
+# Add or remove service blocks as needed.
+#
+# The kustomization must list both images by name, e.g.:
+#   images:
+#     - name: ghcr.io/<owner>/<repo>-web
+#       newTag: main-0000000
+#     - name: ghcr.io/<owner>/<repo>-api
+#       newTag: main-0000000
+name: build
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build-web:
+    uses: PLACEHOLDER_CUSTOMERORG/logisk-platform-workflows/.github/workflows/build-and-push.yaml@v1
+    with:
+      context: ./web
+      image_suffix: -web
+
+  build-api:
+    uses: PLACEHOLDER_CUSTOMERORG/logisk-platform-workflows/.github/workflows/build-and-push.yaml@v1
+    with:
+      context: ./api
+      image_suffix: -api
+
+  open-draft-pr:
+    if: github.event_name == 'push' && github.ref != 'refs/heads/main'
+    uses: PLACEHOLDER_CUSTOMERORG/logisk-platform-workflows/.github/workflows/open-draft-pr.yaml@v1
+    secrets: inherit
+
+  # bump-prod-* jobs are chained (needs:) so pushes to main happen one at a time.
+  # The bumpers also retry with pull --rebase, but explicit serialization is cleaner.
+  bump-prod-web:
+    needs: build-web
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    uses: PLACEHOLDER_CUSTOMERORG/logisk-platform-workflows/.github/workflows/update-prod-manifest.yaml@v1
+    with:
+      image_tag: ${{ needs.build-web.outputs.tag }}
+      image_name: ${{ needs.build-web.outputs.image }}
+
+  bump-prod-api:
+    needs: [build-api, bump-prod-web]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    uses: PLACEHOLDER_CUSTOMERORG/logisk-platform-workflows/.github/workflows/update-prod-manifest.yaml@v1
+    with:
+      image_tag: ${{ needs.build-api.outputs.tag }}
+      image_name: ${{ needs.build-api.outputs.image }}
+
+  bump-preview-web:
+    needs: build-web
+    if: github.event_name == 'pull_request' && github.event.action != 'closed'
+    uses: PLACEHOLDER_CUSTOMERORG/logisk-platform-workflows/.github/workflows/update-preview-manifest.yaml@v1
+    with:
+      image_tag: ${{ needs.build-web.outputs.tag }}
+      image_name: ${{ needs.build-web.outputs.image }}
+
+  bump-preview-api:
+    needs: [build-api, bump-preview-web]
+    if: github.event_name == 'pull_request' && github.event.action != 'closed'
+    uses: PLACEHOLDER_CUSTOMERORG/logisk-platform-workflows/.github/workflows/update-preview-manifest.yaml@v1
+    with:
+      image_tag: ${{ needs.build-api.outputs.tag }}
+      image_name: ${{ needs.build-api.outputs.image }}

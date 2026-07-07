@@ -1,0 +1,55 @@
+name: open-draft-pr
+# Opens a draft PR to main for any non-main branch push, so the ArgoCD
+# PullRequest generator has something to fire on. Uses a GitHub App token
+# (not GITHUB_TOKEN) so the resulting PR *does* trigger follow-on workflows
+# — validated 2026-07-04 spike.
+on:
+  workflow_call:
+    inputs:
+      app_id_var:
+        required: false
+        type: string
+        default: LOGISK_GH_APP_ID
+        description: "Name of the org variable holding the GitHub App ID."
+      installation_id_var:
+        required: false
+        type: string
+        default: LOGISK_GH_APP_INSTALLATION_ID
+        description: "Name of the org variable holding the installation ID."
+      private_key_secret:
+        required: false
+        type: string
+        default: LOGISK_GH_APP_PRIVATE_KEY
+        description: "Name of the org secret holding the App private key."
+
+permissions:
+  contents: read
+
+jobs:
+  open:
+    runs-on: ubuntu-latest
+    steps:
+      - name: mint GitHub App token
+        id: app_token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ vars[inputs.app_id_var] }}
+          private-key: ${{ secrets[inputs.private_key_secret] }}
+          # Scope the token to the calling repo only.
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+
+      - name: open draft PR if none exists
+        env:
+          GH_TOKEN: ${{ steps.app_token.outputs.token }}
+        run: |
+          BRANCH=${GITHUB_REF##refs/heads/}
+          EXISTING=$(gh pr list --repo "$GITHUB_REPOSITORY" --head "$BRANCH" --json number --jq 'length')
+          if [ "$EXISTING" = "0" ]; then
+            gh pr create --repo "$GITHUB_REPOSITORY" \
+              --head "$BRANCH" --base main \
+              --draft --title "[preview] $BRANCH" \
+              --body "Auto-opened by logisk-platform-workflows for the preview environment."
+          else
+            echo "PR already exists for $BRANCH"
+          fi
