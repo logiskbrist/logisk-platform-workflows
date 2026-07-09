@@ -25,14 +25,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.head_ref }}
-          fetch-depth: 1
+          # github.head_ref is only populated on pull_request events. Callers
+          # trigger this workflow on push, so head_ref is empty — fall back to
+          # ref_name (the branch that was pushed). fetch-depth: 0 so the retry
+          # rebase below can see history if a concurrent push landed.
+          ref: ${{ github.head_ref || github.ref_name }}
+          fetch-depth: 0
 
       - env:
           IMAGE_TAG: ${{ inputs.image_tag }}
           IMAGE_NAME: ${{ inputs.image_name }}
           MANIFEST: ${{ inputs.manifest_path }}
-          BRANCH: ${{ github.head_ref }}
+          BRANCH: ${{ github.head_ref || github.ref_name }}
         run: |
           set -euo pipefail
 
