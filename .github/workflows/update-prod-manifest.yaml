@@ -51,7 +51,7 @@ jobs:
           git config user.email "manifest-bot@logiskbrist.no"
           git config user.name "manifest-bot"
           git add "$MANIFEST"
-          MSG="bump prod image${IMAGE_NAME:+ $IMAGE_NAME} to $IMAGE_TAG [skip ci]"
+          MSG="bump prod image${IMAGE_NAME:+ $IMAGE_NAME} to $IMAGE_TAG"
           git commit -m "$MSG"
 
           # Retry on race with a concurrent bump job (e.g. multi-service caller

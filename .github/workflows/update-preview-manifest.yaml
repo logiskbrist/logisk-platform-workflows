@@ -56,7 +56,7 @@ jobs:
           git config user.email "manifest-bot@logiskbrist.no"
           git config user.name "manifest-bot"
           git add "$MANIFEST"
-          MSG="bump preview image${IMAGE_NAME:+ $IMAGE_NAME} to $IMAGE_TAG [skip ci]"
+          MSG="bump preview image${IMAGE_NAME:+ $IMAGE_NAME} to $IMAGE_TAG"
           git commit -m "$MSG"
 
           attempts=0
