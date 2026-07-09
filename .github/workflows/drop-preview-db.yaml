@@ -1,0 +1,83 @@
+name: drop-preview-db
+# Called when a preview PR closes. Drops the per-PR Postgres database
+# (<repo-with-underscores>_pr_<N>) that the app's Dockerfile CMD created.
+#
+# Reads the customer's shared-prod-PG* secrets from Key Vault via OIDC —
+# same auth model as set-secret.yaml.
+#
+# No-op if the DB doesn't exist (customer set an app to shared-DB mode,
+# or the PR never opened a preview).
+
+on:
+  workflow_call:
+    inputs:
+      pr_number:
+        required: true
+        type: string
+      keyvault_var:
+        required: false
+        type: string
+        default: LOGISK_KEYVAULT_NAME
+      azure_client_id_var:
+        required: false
+        type: string
+        default: LOGISK_AZURE_CLIENT_ID
+      azure_tenant_id_var:
+        required: false
+        type: string
+        default: LOGISK_AZURE_TENANT_ID
+      azure_subscription_id_var:
+        required: false
+        type: string
+        default: LOGISK_AZURE_SUBSCRIPTION_ID
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  drop:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ vars[inputs.azure_client_id_var] }}
+          tenant-id: ${{ vars[inputs.azure_tenant_id_var] }}
+          subscription-id: ${{ vars[inputs.azure_subscription_id_var] }}
+
+      - name: drop preview database
+        env:
+          KV: ${{ vars[inputs.keyvault_var] }}
+          PR: ${{ inputs.pr_number }}
+        run: |
+          set -euo pipefail
+
+          # Derive the DB name the same way the app's Dockerfile did.
+          REPO=$(basename "$GITHUB_REPOSITORY")
+          REPO_UNDERSCORE=$(echo "$REPO" | tr - _)
+          DBNAME="${REPO_UNDERSCORE}_pr_${PR}"
+
+          # Read the shared platform Postgres credentials from KV.
+          PGHOST=$(az keyvault secret show --vault-name "$KV" --name shared-prod-PGHOST --query value -o tsv)
+          PGUSER=$(az keyvault secret show --vault-name "$KV" --name shared-prod-PGUSER --query value -o tsv)
+          PGPORT=$(az keyvault secret show --vault-name "$KV" --name shared-prod-PGPORT --query value -o tsv)
+          PGPASSWORD=$(az keyvault secret show --vault-name "$KV" --name shared-prod-PGPASSWORD --query value -o tsv)
+          echo "::add-mask::$PGPASSWORD"
+          export PGPASSWORD
+
+          sudo apt-get update -y >/dev/null
+          sudo apt-get install -y --no-install-recommends postgresql-client >/dev/null
+
+          # Kick any live connections to the DB, then drop. Both statements
+          # are idempotent — DROP DATABASE IF EXISTS returns success on
+          # missing DB (customer running an app in shared-DB mode).
+          psql "host=$PGHOST port=$PGPORT user=$PGUSER dbname=postgres sslmode=require" \
+            --set=ON_ERROR_STOP=1 <<SQL
+            SELECT pg_terminate_backend(pid)
+              FROM pg_stat_activity
+              WHERE datname = '${DBNAME}'
+                AND pid <> pg_backend_pid();
+            DROP DATABASE IF EXISTS "${DBNAME}";
+          SQL
+
+          echo "Dropped preview database '${DBNAME}' (or it did not exist)."
