@@ -47,7 +47,11 @@ jobs:
           fi
 
       - id: image
-        run: echo "name=ghcr.io/${{ github.repository }}${{ inputs.image_suffix }}" >> "$GITHUB_OUTPUT"
+        # GHCR requires lowercase repository names, but ${{ github.repository }}
+        # preserves the case of the GitHub repo. Lowercase here so mixed-case
+        # onboarded repos don't fail with "invalid tag: repository name must be
+        # lowercase".
+        run: echo "name=ghcr.io/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')${{ inputs.image_suffix }}" >> "$GITHUB_OUTPUT"
 
       - uses: docker/login-action@v3
         with:
