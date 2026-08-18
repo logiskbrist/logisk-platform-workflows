@@ -67,5 +67,12 @@ jobs:
           file: ${{ inputs.context }}/${{ inputs.dockerfile }}
           push: true
           tags: ${{ steps.image.outputs.name }}:${{ steps.tag.outputs.tag }}
+          # Lets the app bake its own image tag in and report it from
+          # /api/health (`ARG IMAGE_TAG` / `ENV IMAGE_TAG` in the Dockerfile),
+          # which is how verify-preview / verify-prod confirm the *new* image is
+          # live rather than the previous one. Dockerfiles that don't declare
+          # the ARG are unaffected — buildkit only emits a warning.
+          build-args: |
+            IMAGE_TAG=${{ steps.tag.outputs.tag }}
           cache-from: type=gha,scope=${{ github.workflow }}${{ inputs.image_suffix }}
           cache-to: type=gha,mode=max,scope=${{ github.workflow }}${{ inputs.image_suffix }}

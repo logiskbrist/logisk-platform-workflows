@@ -1,0 +1,473 @@
+name: ai-review
+# Runs an AI code review over the PR diff and leaves one sticky comment.
+#
+# The job id MUST stay `ai-review` — the org ruleset requires the
+# `ai-review / ai-review` check context on customer app repos.
+#
+# The sticky comment carries the sha256 of the (filtered) diff. When a run sees
+# a comment whose sha matches the current diff, it reuses that verdict instead
+# of calling the API again — the manifest-bump commit changes the head sha but
+# not the reviewable diff, so the re-run is free.
+on:
+  workflow_call:
+    inputs:
+      pr_number:
+        required: false
+        type: string
+        default: ''
+        description: "PR to review. Derived from the event, or from the branch, when empty."
+      model:
+        required: false
+        type: string
+        default: claude-sonnet-5
+      fail_on:
+        required: false
+        type: string
+        default: high
+        description: "none | high. `high` fails the check when a finding is both high severity and high confidence."
+      max_diff_chars:
+        required: false
+        type: number
+        default: 120000
+      api_key_secret:
+        required: false
+        type: string
+        default: ANTHROPIC_API_KEY
+        description: "Name of the org secret holding the Anthropic API key. Without it the review is skipped and the check passes."
+      app_id_var:
+        required: false
+        type: string
+        default: LOGISK_GH_APP_ID
+      installation_id_var:
+        required: false
+        type: string
+        default: LOGISK_GH_APP_INSTALLATION_ID
+      private_key_secret:
+        required: false
+        type: string
+        default: LOGISK_GH_APP_PRIVATE_KEY
+    outputs:
+      verdict:
+        description: "pass | fail | skipped"
+        value: ${{ jobs.ai-review.outputs.verdict }}
+      summary:
+        description: "One-line Norwegian summary of the review."
+        value: ${{ jobs.ai-review.outputs.summary }}
+      findings_json:
+        description: "Compact JSON array of findings."
+        value: ${{ jobs.ai-review.outputs.findings_json }}
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  ai-review:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      verdict: ${{ steps.verdict.outputs.verdict }}
+      summary: ${{ steps.verdict.outputs.summary }}
+      findings_json: ${{ steps.verdict.outputs.findings_json }}
+    steps:
+      - name: resolve App token configuration
+        id: appcfg
+        env:
+          APP_ID: ${{ vars[inputs.app_id_var] }}
+          HAS_PRIVATE_KEY: ${{ secrets[inputs.private_key_secret] != '' }}
+          HAS_API_KEY: ${{ secrets[inputs.api_key_secret] != '' }}
+        run: |
+          set -euo pipefail
+          if [ -n "$APP_ID" ] && [ "$HAS_PRIVATE_KEY" = "true" ]; then
+            echo "use_app=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "use_app=false" >> "$GITHUB_OUTPUT"
+          fi
+          printf 'has_api_key=%s\n' "$HAS_API_KEY" >> "$GITHUB_OUTPUT"
+
+      - name: not configured
+        id: unconfigured
+        if: steps.appcfg.outputs.has_api_key != 'true'
+        run: |
+          set -euo pipefail
+          {
+            echo "### AI-gjennomgang"
+            echo ""
+            echo "AI-review er ikke aktivert (mangler ANTHROPIC_API_KEY)."
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "ANTHROPIC_API_KEY (secret name: ${{ inputs.api_key_secret }}) is not set for this org; skipping."
+
+      - name: mint GitHub App token
+        id: app_token
+        if: steps.appcfg.outputs.has_api_key == 'true' && steps.appcfg.outputs.use_app == 'true'
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ vars[inputs.app_id_var] }}
+          private-key: ${{ secrets[inputs.private_key_secret] }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+
+      - uses: actions/checkout@v4
+        if: steps.appcfg.outputs.has_api_key == 'true'
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+
+      - name: resolve PR number
+        id: pr
+        if: steps.appcfg.outputs.has_api_key == 'true'
+        env:
+          GH_TOKEN: ${{ steps.app_token.outputs.token || github.token }}
+          PR_IN: ${{ inputs.pr_number }}
+          EVENT_PR: ${{ github.event.pull_request.number }}
+          BRANCH: ${{ github.head_ref || github.ref_name }}
+        run: |
+          set -euo pipefail
+          PR="$PR_IN"
+          [ -n "$PR" ] || PR="$EVENT_PR"
+          if [ -z "$PR" ]; then
+            PR=$(gh pr list --repo "$GITHUB_REPOSITORY" --head "$BRANCH" --json number --jq '.[0].number // ""')
+          fi
+          if [ -z "$PR" ]; then
+            echo "::error::Fant ingen publisering å gå gjennom."
+            echo "Could not resolve a PR number from inputs, the event, or branch '$BRANCH'."
+            exit 1
+          fi
+          printf 'number=%s\n' "$PR" >> "$GITHUB_OUTPUT"
+
+      - name: collect and filter the diff
+        id: diff
+        if: steps.appcfg.outputs.has_api_key == 'true'
+        env:
+          GH_TOKEN: ${{ steps.app_token.outputs.token || github.token }}
+          PR: ${{ steps.pr.outputs.number }}
+        run: |
+          set -euo pipefail
+          gh pr diff "$PR" --repo "$GITHUB_REPOSITORY" > /tmp/raw.diff
+
+          python3 - <<'PY'
+          import re
+
+          EXCLUDE = [
+              "pnpm-lock.yaml", "package-lock.json", "yarn.lock",
+              "manifests/**", "*.svg", "*.png",
+          ]
+
+          def glob_re(pat: str) -> re.Pattern:
+              out, i = ["^"], 0
+              while i < len(pat):
+                  if pat.startswith("**/", i):
+                      out.append("(?:.*/)?"); i += 3
+                  elif pat.startswith("**", i):
+                      out.append(".*"); i += 2
+                  elif pat[i] == "*":
+                      out.append("[^/]*"); i += 1
+                  elif pat[i] == "?":
+                      out.append("[^/]"); i += 1
+                  else:
+                      out.append(re.escape(pat[i])); i += 1
+              out.append("$")
+              return re.compile("".join(out))
+
+          MATCHERS = [(p, glob_re(p)) for p in EXCLUDE]
+
+          def excluded(path: str) -> bool:
+              base = path.rsplit("/", 1)[-1]
+              for pat, rx in MATCHERS:
+                  if rx.match(path):
+                      return True
+                  # A pattern with no slash also matches the basename, so
+                  # "*.svg" covers src/icons/logo.svg, not just root-level files.
+                  if "/" not in pat and rx.match(base):
+                      return True
+              return False
+
+          blocks, current, path = [], None, None
+          with open("/tmp/raw.diff", encoding="utf-8", errors="replace") as fh:
+              for line in fh:
+                  if line.startswith("diff --git "):
+                      if current is not None and not excluded(path or ""):
+                          blocks.append("".join(current))
+                      m = re.match(r"diff --git a/(.*?) b/(.*)$", line.rstrip("\n"))
+                      path = (m.group(2) if m else "").strip()
+                      current = [line]
+                  elif current is not None:
+                      current.append(line)
+          if current is not None and not excluded(path or ""):
+              blocks.append("".join(current))
+
+          with open("/tmp/filtered.diff", "w", encoding="utf-8") as fh:
+              fh.write("".join(blocks))
+          PY
+
+          SHA=$(sha256sum /tmp/filtered.diff | cut -d' ' -f1)
+          printf 'sha=%s\n' "$SHA" >> "$GITHUB_OUTPUT"
+          if [ ! -s /tmp/filtered.diff ]; then
+            echo "empty=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "empty=false" >> "$GITHUB_OUTPUT"
+          fi
+          echo "Filtered diff: $(wc -c < /tmp/filtered.diff) bytes, sha256 $SHA"
+
+      - name: look for a matching sticky comment
+        id: sticky
+        if: steps.appcfg.outputs.has_api_key == 'true'
+        env:
+          GH_TOKEN: ${{ steps.app_token.outputs.token || github.token }}
+          PR: ${{ steps.pr.outputs.number }}
+          DIFF_SHA: ${{ steps.diff.outputs.sha }}
+        run: |
+          set -euo pipefail
+          gh api "repos/$GITHUB_REPOSITORY/issues/$PR/comments" --paginate --jq '.[]' \
+            | jq -s '[.[] | select(.body != null and (.body | contains("<!-- ai-review diff:")))] | last // empty' \
+            > /tmp/sticky.json
+
+          if [ ! -s /tmp/sticky.json ]; then
+            echo "id=" >> "$GITHUB_OUTPUT"
+            echo "reuse=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          ID=$(jq -r '.id' /tmp/sticky.json)
+          BODY=$(jq -r '.body' /tmp/sticky.json)
+          OLD_SHA=$(printf '%s' "$BODY" | sed -n 's/.*<!-- ai-review diff:\([0-9a-f]*\) verdict:\([a-z]*\) -->.*/\1/p' | head -n1)
+          OLD_VERDICT=$(printf '%s' "$BODY" | sed -n 's/.*<!-- ai-review diff:\([0-9a-f]*\) verdict:\([a-z]*\) -->.*/\2/p' | head -n1)
+
+          printf 'id=%s\n' "$ID" >> "$GITHUB_OUTPUT"
+          if [ -n "$OLD_SHA" ] && [ "$OLD_SHA" = "$DIFF_SHA" ] && [ -n "$OLD_VERDICT" ]; then
+            printf 'reuse=true\n' >> "$GITHUB_OUTPUT"
+            printf 'verdict=%s\n' "$OLD_VERDICT" >> "$GITHUB_OUTPUT"
+            echo "Diff unchanged since the last review (sha $DIFF_SHA) — reusing verdict '$OLD_VERDICT'."
+          else
+            echo "reuse=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: run the AI review
+        id: review
+        if: steps.appcfg.outputs.has_api_key == 'true' && steps.sticky.outputs.reuse != 'true'
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets[inputs.api_key_secret] }}
+          MODEL: ${{ inputs.model }}
+          MAX_DIFF_CHARS: ${{ inputs.max_diff_chars }}
+          DIFF_EMPTY: ${{ steps.diff.outputs.empty }}
+          SYSTEM_PROMPT: |
+            You are a senior code reviewer for a Next.js / Prisma / Better Auth application running on a managed Kubernetes platform.
+
+            Review the diff for:
+            1. Correctness bugs — logic errors, wrong types, unhandled null/undefined, broken async flow, off-by-one, race conditions.
+            2. Security — missing authentication or authorization checks on routes and Server Actions, SQL/command/template injection, secrets or tokens leaking into logs, client bundles or git, over-broad data exposure in API responses, unvalidated user input.
+            3. Platform invariants — never write secrets into git; do not edit files under manifests/base/; the Next.js config must not set output: "standalone"; a file containing Server Actions ("use server") must export only async functions.
+
+            Only report problems you can see in the diff. Do not report style preferences, formatting, or speculative refactors. Prefer few high-signal findings over many weak ones. Be honest about confidence: use "high" confidence only when the diff itself shows the problem.
+
+            Respond with STRICT JSON and nothing else. No prose, no markdown code fences. Shape:
+            {"summary_no": "<one line in Norwegian bokmål, plain language>", "findings": [{"severity": "high|medium|low", "confidence": "high|medium|low", "file": "path/to/file.ts", "line": 123, "title": "short title", "detail": "what is wrong and what to do instead"}]}
+
+            If you find nothing, return an empty findings array.
+        run: |
+          set -euo pipefail
+
+          if [ "$DIFF_EMPTY" = "true" ]; then
+            jq -n '{summary_no: "Ingen kodeendringer å gå gjennom.", findings: []}' > /tmp/review.json
+            exit 0
+          fi
+
+          # Truncate to the caller's budget, with an explicit note so the model
+          # knows it is not seeing everything.
+          if [ "$(wc -c < /tmp/filtered.diff)" -gt "$MAX_DIFF_CHARS" ]; then
+            head -c "$MAX_DIFF_CHARS" /tmp/filtered.diff > /tmp/diff.txt
+            printf '\n\n[NOTE: the diff was truncated at %s characters. Review what you can see; do not speculate about the rest.]\n' "$MAX_DIFF_CHARS" >> /tmp/diff.txt
+          else
+            cp /tmp/filtered.diff /tmp/diff.txt
+          fi
+
+          : > /tmp/appctx.txt
+          if [ -f CLAUDE.md ]; then
+            {
+              echo "The app repository's CLAUDE.md (first 200 lines), for project context:"
+              echo "<claude_md>"
+              head -n 200 CLAUDE.md
+              echo "</claude_md>"
+              echo ""
+            } > /tmp/appctx.txt
+          fi
+
+
+          USER=$(cat /tmp/appctx.txt; printf 'Review this diff:\n\n<diff>\n'; cat /tmp/diff.txt; printf '\n</diff>\n')
+
+          jq -n --arg model "$MODEL" --arg system "$SYSTEM_PROMPT" --arg user "$USER" \
+            '{model: $model, max_tokens: 4000, system: $system,
+              messages: [{role: "user", content: $user}]}' > /tmp/req.json
+
+          # Retry transient failures (rate limit / overloaded / network) with
+          # backoff so a blip doesn't block a publish. 4xx other than 429 is final.
+          HTTP=000
+          for attempt in 1 2 3 4 5; do
+            HTTP=$(curl -sS -X POST https://api.anthropic.com/v1/messages \
+              -H "x-api-key: $ANTHROPIC_API_KEY" \
+              -H "anthropic-version: 2023-06-01" \
+              -H "content-type: application/json" \
+              --data @/tmp/req.json \
+              -o /tmp/resp.json -w '%{http_code}') || HTTP=000
+            case "$HTTP" in
+              200) break ;;
+              000|408|409|429|5*) echo "Anthropic API HTTP $HTTP (attempt $attempt/5), retrying..."; sleep $((attempt * 15)) ;;
+              *) break ;;
+            esac
+          done
+
+          if [ "$HTTP" != "200" ]; then
+            echo "::error::AI-gjennomgangen kunne ikke kjøres."
+            echo "Anthropic API returned HTTP $HTTP."
+            jq -r '.error.type + ": " + .error.message' /tmp/resp.json 2>/dev/null || true
+            exit 1
+          fi
+
+          jq -r '[.content[] | select(.type == "text") | .text] | join("\n")' /tmp/resp.json > /tmp/text.out
+
+          # Models sometimes wrap strict JSON in a fence despite instructions.
+          python3 - <<'PY'
+          import json, re, sys
+          raw = open("/tmp/text.out", encoding="utf-8").read().strip()
+          fence = re.match(r"^```(?:json)?\s*(.*?)\s*```$", raw, re.S)
+          if fence:
+              raw = fence.group(1).strip()
+          if not raw.startswith("{"):
+              start, end = raw.find("{"), raw.rfind("}")
+              if start != -1 and end > start:
+                  raw = raw[start:end + 1]
+          try:
+              data = json.loads(raw)
+          except Exception as exc:
+              print(f"could not parse model output as JSON: {exc}", file=sys.stderr)
+              print(raw[:2000], file=sys.stderr)
+              sys.exit(1)
+          out = {
+              "summary_no": str(data.get("summary_no") or "AI-gjennomgang fullført."),
+              "findings": [f for f in (data.get("findings") or []) if isinstance(f, dict)],
+          }
+          json.dump(out, open("/tmp/review.json", "w", encoding="utf-8"), ensure_ascii=False)
+          PY
+
+      - name: compute verdict
+        id: verdict
+        if: always()
+        env:
+          HAS_API_KEY: ${{ steps.appcfg.outputs.has_api_key }}
+          REUSE: ${{ steps.sticky.outputs.reuse }}
+          REUSED_VERDICT: ${{ steps.sticky.outputs.verdict }}
+          FAIL_ON: ${{ inputs.fail_on }}
+          REVIEW_OUTCOME: ${{ steps.review.outcome }}
+        run: |
+          set -euo pipefail
+
+          if [ "$HAS_API_KEY" != "true" ]; then
+            {
+              printf 'verdict=skipped\n'
+              printf 'summary=AI-review er ikke aktivert (mangler ANTHROPIC_API_KEY)\n'
+              printf 'findings_json=[]\n'
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [ "$REUSE" = "true" ]; then
+            {
+              printf 'verdict=%s\n' "$REUSED_VERDICT"
+              printf 'summary=Uendret siden forrige gjennomgang\n'
+              printf 'findings_json=[]\n'
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [ "$REVIEW_OUTCOME" != "success" ]; then
+            {
+              printf 'verdict=skipped\n'
+              printf 'summary=AI-gjennomgangen kunne ikke kjøres\n'
+              printf 'findings_json=[]\n'
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          SUMMARY=$(jq -r '.summary_no' /tmp/review.json | tr '\n' ' ')
+          FINDINGS=$(jq -c '.findings' /tmp/review.json)
+          BLOCKING=$(jq '[.findings[] | select(.severity == "high" and .confidence == "high")] | length' /tmp/review.json)
+
+          VERDICT=pass
+          if [ "$FAIL_ON" = "high" ] && [ "$BLOCKING" -gt 0 ]; then
+            VERDICT=fail
+          fi
+
+          {
+            printf 'verdict=%s\n' "$VERDICT"
+            printf 'summary=%s\n' "$SUMMARY"
+            printf 'findings_json=%s\n' "$FINDINGS"
+            printf 'blocking=%s\n' "$BLOCKING"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: render the report
+        id: render
+        if: steps.appcfg.outputs.has_api_key == 'true' && steps.sticky.outputs.reuse != 'true' && steps.review.outcome == 'success'
+        env:
+          DIFF_SHA: ${{ steps.diff.outputs.sha }}
+          VERDICT: ${{ steps.verdict.outputs.verdict }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os
+
+          data = json.load(open("/tmp/review.json", encoding="utf-8"))
+          findings = data["findings"]
+          order = {"high": 0, "medium": 1, "low": 2}
+          findings.sort(key=lambda f: (order.get(str(f.get("severity")), 3),
+                                       order.get(str(f.get("confidence")), 3)))
+
+          def cell(text):
+              return str(text or "").replace("|", "\\|").replace("\n", " ").strip()
+
+          lines = ["### AI-gjennomgang", "", data["summary_no"], ""]
+          if findings:
+              lines += [
+                  "| Alvorlighet | Sikkerhet | Fil | Funn | Detaljer |",
+                  "|---|---|---|---|---|",
+              ]
+              for f in findings:
+                  loc = cell(f.get("file"))
+                  if f.get("line"):
+                      loc = f"{loc}:{cell(f.get('line'))}"
+                  lines.append(
+                      f"| {cell(f.get('severity'))} | {cell(f.get('confidence'))} "
+                      f"| `{loc}` | {cell(f.get('title'))} | {cell(f.get('detail'))} |"
+                  )
+          else:
+              lines.append("Ingen problemer funnet.")
+
+          lines += ["", f"<!-- ai-review diff:{os.environ['DIFF_SHA']} verdict:{os.environ['VERDICT']} -->"]
+          open("/tmp/comment.md", "w", encoding="utf-8").write("\n".join(lines) + "\n")
+          PY
+          cat /tmp/comment.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: upsert the sticky comment
+        if: steps.appcfg.outputs.has_api_key == 'true' && steps.render.outcome == 'success'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ steps.app_token.outputs.token || github.token }}
+          PR: ${{ steps.pr.outputs.number }}
+          COMMENT_ID: ${{ steps.sticky.outputs.id }}
+        run: |
+          set -euo pipefail
+          jq -n --rawfile body /tmp/comment.md '{body: $body}' > /tmp/comment.json
+          if [ -n "$COMMENT_ID" ]; then
+            gh api --method PATCH "repos/$GITHUB_REPOSITORY/issues/comments/$COMMENT_ID" \
+              --input /tmp/comment.json >/dev/null
+            echo "Updated sticky comment $COMMENT_ID."
+          else
+            gh api --method POST "repos/$GITHUB_REPOSITORY/issues/$PR/comments" \
+              --input /tmp/comment.json >/dev/null
+            echo "Created sticky comment."
+          fi
+
+      - name: fail on blocking findings
+        if: always() && steps.verdict.outputs.verdict == 'fail'
+        run: |
+          set -euo pipefail
+          echo "::error::AI-review fant alvorlige feil — se kommentaren på PR-en"
+          exit 1

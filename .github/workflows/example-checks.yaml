@@ -1,0 +1,29 @@
+# NOT a reusable workflow. Copy this file into a customer app repo at
+# .github/workflows/checks.yaml.
+#
+# These are the PR checks: an AI code review, and a check that the preview
+# environment really came up on the new image.
+#
+# The job ids matter. The org ruleset requires the check contexts
+# `ai-review / ai-review` and `verify-preview / verify-preview`, which are
+# formed as "<caller job id> / <reusable job id>" — so the job ids here must
+# match the reusable workflows' job ids exactly.
+#
+# This runs on `pull_request` rather than inside build.yaml so that the
+# manifest bump (pushed with the GitHub App token, which fires `synchronize`)
+# re-runs these checks against the commit that actually carries the new image.
+name: checks
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+jobs:
+  ai-review:
+    uses: PLACEHOLDER_CUSTOMERORG/logisk-platform-workflows/.github/workflows/ai-review.yaml@v1
+    secrets: inherit
+
+  verify-preview:
+    uses: PLACEHOLDER_CUSTOMERORG/logisk-platform-workflows/.github/workflows/verify-preview.yaml@v1
+    with:
+      domain: PLACEHOLDER_CUSTOMER_DOMAIN
+    secrets: inherit

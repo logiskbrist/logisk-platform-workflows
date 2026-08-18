@@ -14,6 +14,28 @@ on:
         type: string
         default: ''
         description: "If set, scopes the bump to the kustomize images entry with this .name. Required for multi-image manifests."
+      app_id_var:
+        required: false
+        type: string
+        default: LOGISK_GH_APP_ID
+        description: "Name of the org variable holding the GitHub App ID. Falls back to GITHUB_TOKEN if unset."
+      installation_id_var:
+        required: false
+        type: string
+        default: LOGISK_GH_APP_INSTALLATION_ID
+        description: "Name of the org variable holding the installation ID."
+      private_key_secret:
+        required: false
+        type: string
+        default: LOGISK_GH_APP_PRIVATE_KEY
+        description: "Name of the org secret holding the App private key."
+    outputs:
+      previous_tag:
+        description: "The newTag value in the manifest BEFORE this bump. Empty if the manifest had none."
+        value: ${{ jobs.bump.outputs.previous_tag }}
+      image_tag:
+        description: "The newTag value written by this bump (echo of inputs.image_tag)."
+        value: ${{ jobs.bump.outputs.image_tag }}
 
 permissions:
   contents: write
@@ -22,7 +44,39 @@ permissions:
 jobs:
   bump:
     runs-on: ubuntu-latest
+    outputs:
+      previous_tag: ${{ steps.bump.outputs.previous_tag }}
+      image_tag: ${{ steps.bump.outputs.image_tag }}
     steps:
+      # The bump commit is pushed with the GitHub App token, not GITHUB_TOKEN.
+      # A GITHUB_TOKEN push triggers nothing, so the PR checks would keep running
+      # against the pre-bump head commit and never see the new preview image.
+      # An App-token push fires `pull_request: synchronize`, re-running the PR
+      # checks on the commit that actually carries the new tag.
+      - name: resolve App token configuration
+        id: appcfg
+        env:
+          APP_ID: ${{ vars[inputs.app_id_var] }}
+          HAS_PRIVATE_KEY: ${{ secrets[inputs.private_key_secret] != '' }}
+        run: |
+          set -euo pipefail
+          if [ -n "$APP_ID" ] && [ "$HAS_PRIVATE_KEY" = "true" ]; then
+            echo "use_app=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "use_app=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::GitHub App not configured for this org — falling back to GITHUB_TOKEN. PR checks will not re-run on the bump commit."
+          fi
+
+      - name: mint GitHub App token
+        id: app_token
+        if: steps.appcfg.outputs.use_app == 'true'
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ vars[inputs.app_id_var] }}
+          private-key: ${{ secrets[inputs.private_key_secret] }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+
       - uses: actions/checkout@v4
         with:
           # github.head_ref is only populated on pull_request events. Callers
@@ -31,8 +85,10 @@ jobs:
           # rebase below can see history if a concurrent push landed.
           ref: ${{ github.head_ref || github.ref_name }}
           fetch-depth: 0
+          token: ${{ steps.app_token.outputs.token || github.token }}
 
-      - env:
+      - id: bump
+        env:
           IMAGE_TAG: ${{ inputs.image_tag }}
           IMAGE_NAME: ${{ inputs.image_name }}
           MANIFEST: ${{ inputs.manifest_path }}
@@ -41,15 +97,21 @@ jobs:
           set -euo pipefail
 
           if [ -n "$IMAGE_NAME" ]; then
-            CURRENT=$(yq -r "(.images[] | select(.name == \"$IMAGE_NAME\") | .newTag) // \"\"" "$MANIFEST")
-            if [ "$CURRENT" = "$IMAGE_TAG" ]; then
-              echo "Preview manifest already at $IMAGE_TAG for $IMAGE_NAME, nothing to do."; exit 0
-            fi
-            yq -i "(.images[] | select(.name == \"$IMAGE_NAME\") | .newTag) = \"$IMAGE_TAG\"" "$MANIFEST"
+            CURRENT=$(yq -r '(.images[] | select(.name == strenv(IMAGE_NAME)) | .newTag) // ""' "$MANIFEST")
           else
-            if grep -q "newTag: $IMAGE_TAG" "$MANIFEST"; then
-              echo "Preview manifest already at $IMAGE_TAG, nothing to do."; exit 0
-            fi
+            CURRENT=$(sed -n 's/^[[:space:]]*newTag:[[:space:]]*//p' "$MANIFEST" | head -n1)
+          fi
+          printf 'previous_tag=%s\n' "$CURRENT" >> "$GITHUB_OUTPUT"
+          printf 'image_tag=%s\n' "$IMAGE_TAG" >> "$GITHUB_OUTPUT"
+
+          if [ "$CURRENT" = "$IMAGE_TAG" ]; then
+            echo "Preview manifest already at $IMAGE_TAG${IMAGE_NAME:+ for $IMAGE_NAME}, nothing to do."
+            exit 0
+          fi
+
+          if [ -n "$IMAGE_NAME" ]; then
+            yq -i '(.images[] | select(.name == strenv(IMAGE_NAME)) | .newTag) = strenv(IMAGE_TAG)' "$MANIFEST"
+          else
             sed -i "s|newTag: .*|newTag: $IMAGE_TAG|" "$MANIFEST"
           fi
 

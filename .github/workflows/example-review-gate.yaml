@@ -1,0 +1,29 @@
+# NOT a reusable workflow. Copy this file into a customer app repo at
+# .github/workflows/review-gate.yaml.
+#
+# The Logisk Brist review gate. On apps that are NOT marked critical this is a
+# no-op that passes immediately, so it is safe to install everywhere.
+#
+# Two triggers are required:
+#   - pull_request        → re-evaluate whenever the change itself moves
+#   - pull_request_review → re-evaluate the moment a reviewer approves, so the
+#                           check goes green without another push
+# `github.event.pull_request.number` is present on both.
+#
+# The job id must stay `lb-review-gate` — the org ruleset requires the
+# `lb-review-gate / lb-review-gate` check context.
+name: review-gate
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+  pull_request_review:
+    types: [submitted, dismissed]
+
+jobs:
+  lb-review-gate:
+    uses: PLACEHOLDER_CUSTOMERORG/logisk-platform-workflows/.github/workflows/lb-review-gate.yaml@v1
+    # Optional: pass `preview_url:` to link the test version from the review
+    # comment. Only do that if you can produce the *slugified* URL — the raw
+    # branch name is not the hostname (see verify-preview's slug rules), so a
+    # naive interpolation of github.head_ref yields a dead link.
+    secrets: inherit

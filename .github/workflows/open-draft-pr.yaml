@@ -21,6 +21,10 @@ on:
         type: string
         default: LOGISK_GH_APP_PRIVATE_KEY
         description: "Name of the org secret holding the App private key."
+    outputs:
+      pr_number:
+        description: "Number of the PR for this branch — the one just created, or the one that already existed. Empty only if neither could be resolved."
+        value: ${{ jobs.open.outputs.pr_number }}
 
 permissions:
   contents: read
@@ -28,6 +32,8 @@ permissions:
 jobs:
   open:
     runs-on: ubuntu-latest
+    outputs:
+      pr_number: ${{ steps.pr.outputs.pr_number }}
     steps:
       - name: mint GitHub App token
         id: app_token
@@ -40,16 +46,20 @@ jobs:
           repositories: ${{ github.event.repository.name }}
 
       - name: open draft PR if none exists
+        id: pr
         env:
           GH_TOKEN: ${{ steps.app_token.outputs.token }}
         run: |
+          set -euo pipefail
           BRANCH=${GITHUB_REF##refs/heads/}
-          EXISTING=$(gh pr list --repo "$GITHUB_REPOSITORY" --head "$BRANCH" --json number --jq 'length')
-          if [ "$EXISTING" = "0" ]; then
+          EXISTING=$(gh pr list --repo "$GITHUB_REPOSITORY" --head "$BRANCH" --json number --jq '.[0].number // ""')
+          if [ -z "$EXISTING" ]; then
             gh pr create --repo "$GITHUB_REPOSITORY" \
               --head "$BRANCH" --base main \
               --draft --title "[preview] $BRANCH" \
               --body "Auto-opened by logisk-platform-workflows for the preview environment."
+            EXISTING=$(gh pr list --repo "$GITHUB_REPOSITORY" --head "$BRANCH" --json number --jq '.[0].number // ""')
           else
-            echo "PR already exists for $BRANCH"
+            echo "PR already exists for $BRANCH (#$EXISTING)"
           fi
+          printf 'pr_number=%s\n' "$EXISTING" >> "$GITHUB_OUTPUT"

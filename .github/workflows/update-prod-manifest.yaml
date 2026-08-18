@@ -14,6 +14,28 @@ on:
         type: string
         default: ''
         description: "If set, scopes the bump to the kustomize images entry with this .name. Required for multi-image manifests."
+      app_id_var:
+        required: false
+        type: string
+        default: LOGISK_GH_APP_ID
+        description: "Name of the org variable holding the GitHub App ID. Falls back to GITHUB_TOKEN if unset."
+      installation_id_var:
+        required: false
+        type: string
+        default: LOGISK_GH_APP_INSTALLATION_ID
+        description: "Name of the org variable holding the installation ID."
+      private_key_secret:
+        required: false
+        type: string
+        default: LOGISK_GH_APP_PRIVATE_KEY
+        description: "Name of the org secret holding the App private key."
+    outputs:
+      previous_tag:
+        description: "The newTag value in the manifest BEFORE this bump. Empty if the manifest had none. Feed this to verify-prod as previous_tag so a failed rollout can be rolled back."
+        value: ${{ jobs.bump.outputs.previous_tag }}
+      image_tag:
+        description: "The newTag value written by this bump (echo of inputs.image_tag)."
+        value: ${{ jobs.bump.outputs.image_tag }}
 
 permissions:
   contents: write
@@ -21,12 +43,47 @@ permissions:
 jobs:
   bump:
     runs-on: ubuntu-latest
+    outputs:
+      previous_tag: ${{ steps.bump.outputs.previous_tag }}
+      image_tag: ${{ steps.bump.outputs.image_tag }}
     steps:
+      # The bump commit is pushed with the GitHub App token, not GITHUB_TOKEN:
+      #   (a) a "no direct push to main" ruleset lists the App as a bypass actor;
+      #   (b) App-token pushes trigger follow-on workflows, GITHUB_TOKEN pushes do not.
+      # Orgs that have not installed the App fall back to GITHUB_TOKEN.
+      - name: resolve App token configuration
+        id: appcfg
+        env:
+          APP_ID: ${{ vars[inputs.app_id_var] }}
+          HAS_PRIVATE_KEY: ${{ secrets[inputs.private_key_secret] != '' }}
+        run: |
+          set -euo pipefail
+          if [ -n "$APP_ID" ] && [ "$HAS_PRIVATE_KEY" = "true" ]; then
+            echo "use_app=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "use_app=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::GitHub App not configured for this org — falling back to GITHUB_TOKEN for the manifest push."
+          fi
+
+      - name: mint GitHub App token
+        id: app_token
+        if: steps.appcfg.outputs.use_app == 'true'
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ vars[inputs.app_id_var] }}
+          private-key: ${{ secrets[inputs.private_key_secret] }}
+          # Scope the token to the calling repo only.
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.ref }}
+          # Credentials are persisted by checkout, so the push below uses this token.
+          token: ${{ steps.app_token.outputs.token || github.token }}
 
-      - env:
+      - id: bump
+        env:
           IMAGE_TAG: ${{ inputs.image_tag }}
           IMAGE_NAME: ${{ inputs.image_name }}
           MANIFEST: ${{ inputs.manifest_path }}
@@ -34,17 +91,26 @@ jobs:
         run: |
           set -euo pipefail
 
+          # Read the tag we're replacing BEFORE touching the file, so callers can
+          # roll back to it. yq reads the name/tag from the environment rather than
+          # interpolating them into the expression (no expression injection).
           if [ -n "$IMAGE_NAME" ]; then
-            CURRENT=$(yq -r "(.images[] | select(.name == \"$IMAGE_NAME\") | .newTag) // \"\"" "$MANIFEST")
-            if [ "$CURRENT" = "$IMAGE_TAG" ]; then
-              echo "Manifest already at $IMAGE_TAG for $IMAGE_NAME, nothing to do."; exit 0
-            fi
-            yq -i "(.images[] | select(.name == \"$IMAGE_NAME\") | .newTag) = \"$IMAGE_TAG\"" "$MANIFEST"
+            CURRENT=$(yq -r '(.images[] | select(.name == strenv(IMAGE_NAME)) | .newTag) // ""' "$MANIFEST")
+          else
+            CURRENT=$(sed -n 's/^[[:space:]]*newTag:[[:space:]]*//p' "$MANIFEST" | head -n1)
+          fi
+          printf 'previous_tag=%s\n' "$CURRENT" >> "$GITHUB_OUTPUT"
+          printf 'image_tag=%s\n' "$IMAGE_TAG" >> "$GITHUB_OUTPUT"
+
+          if [ "$CURRENT" = "$IMAGE_TAG" ]; then
+            echo "Manifest already at $IMAGE_TAG${IMAGE_NAME:+ for $IMAGE_NAME}, nothing to do."
+            exit 0
+          fi
+
+          if [ -n "$IMAGE_NAME" ]; then
+            yq -i '(.images[] | select(.name == strenv(IMAGE_NAME)) | .newTag) = strenv(IMAGE_TAG)' "$MANIFEST"
           else
             # Legacy single-image path: unscoped sed. Do not use for multi-image manifests.
-            if grep -q "newTag: $IMAGE_TAG" "$MANIFEST"; then
-              echo "Manifest already at $IMAGE_TAG, nothing to do."; exit 0
-            fi
             sed -i "s|newTag: .*|newTag: $IMAGE_TAG|" "$MANIFEST"
           fi
 

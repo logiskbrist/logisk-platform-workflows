@@ -9,11 +9,18 @@
 #       newTag: main-0000000
 #     - name: ghcr.io/<owner>/<repo>-api
 #       newTag: main-0000000
+#
+# `paths-ignore: manifests/**` is load-bearing: the bump commits are pushed with
+# the GitHub App token, which triggers workflows, so without it the bump would
+# rebuild and bump again forever. Do not copy it into checks.yaml /
+# review-gate.yaml — those must re-run on the bump commit.
 name: build
 on:
   push:
     branches: [main]
+    paths-ignore: [manifests/**]
   pull_request:
+    paths-ignore: [manifests/**]
 
 jobs:
   build-web:
@@ -39,6 +46,7 @@ jobs:
     needs: build-web
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     uses: PLACEHOLDER_CUSTOMERORG/logisk-platform-workflows/.github/workflows/update-prod-manifest.yaml@v1
+    secrets: inherit
     with:
       image_tag: ${{ needs.build-web.outputs.tag }}
       image_name: ${{ needs.build-web.outputs.image }}
@@ -47,6 +55,7 @@ jobs:
     needs: [build-api, bump-prod-web]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     uses: PLACEHOLDER_CUSTOMERORG/logisk-platform-workflows/.github/workflows/update-prod-manifest.yaml@v1
+    secrets: inherit
     with:
       image_tag: ${{ needs.build-api.outputs.tag }}
       image_name: ${{ needs.build-api.outputs.image }}
@@ -55,6 +64,7 @@ jobs:
     needs: build-web
     if: github.event_name == 'pull_request' && github.event.action != 'closed'
     uses: PLACEHOLDER_CUSTOMERORG/logisk-platform-workflows/.github/workflows/update-preview-manifest.yaml@v1
+    secrets: inherit
     with:
       image_tag: ${{ needs.build-web.outputs.tag }}
       image_name: ${{ needs.build-web.outputs.image }}
@@ -63,6 +73,7 @@ jobs:
     needs: [build-api, bump-preview-web]
     if: github.event_name == 'pull_request' && github.event.action != 'closed'
     uses: PLACEHOLDER_CUSTOMERORG/logisk-platform-workflows/.github/workflows/update-preview-manifest.yaml@v1
+    secrets: inherit
     with:
       image_tag: ${{ needs.build-api.outputs.tag }}
       image_name: ${{ needs.build-api.outputs.image }}

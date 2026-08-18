@@ -1,0 +1,346 @@
+name: verify-prod
+# Verifies that production is actually serving the tag we just deployed, and
+# rolls the manifest back to the previous tag if it isn't.
+#
+# The job id MUST stay `verify-prod` — the org ruleset requires the
+# `verify-prod / verify-prod` check context on customer app repos.
+on:
+  workflow_call:
+    inputs:
+      url:
+        required: false
+        type: string
+        default: ''
+        description: "Full base URL of production. If empty, computed from `domain`."
+      domain:
+        required: false
+        type: string
+        default: ''
+        description: "Production domain. The URL becomes https://<repo-name>.<domain>."
+      expect_tag:
+        required: true
+        type: string
+        description: "The image tag that was just deployed. Production must report this tag before we call the publish successful."
+      previous_tag:
+        required: false
+        type: string
+        default: ''
+        description: "The tag production ran before this deploy — usually update-prod-manifest's `previous_tag` output. Required for rollback."
+      health_path:
+        required: false
+        type: string
+        default: /api/health
+      timeout_minutes:
+        required: false
+        type: number
+        default: 10
+      rollback:
+        required: false
+        type: boolean
+        default: true
+        description: "Pin the prod manifest back to `previous_tag` when verification fails."
+      manifest_path:
+        required: false
+        type: string
+        default: manifests/prod/kustomization.yaml
+      image_name:
+        required: false
+        type: string
+        default: ''
+        description: "If set, scopes the rollback to the kustomize images entry with this .name. Same semantics as update-prod-manifest."
+      app_id_var:
+        required: false
+        type: string
+        default: LOGISK_GH_APP_ID
+        description: "Name of the org variable holding the GitHub App ID. Falls back to GITHUB_TOKEN if unset."
+      installation_id_var:
+        required: false
+        type: string
+        default: LOGISK_GH_APP_INSTALLATION_ID
+        description: "Name of the org variable holding the installation ID."
+      private_key_secret:
+        required: false
+        type: string
+        default: LOGISK_GH_APP_PRIVATE_KEY
+        description: "Name of the org secret holding the App private key."
+    outputs:
+      result:
+        description: "ok | failed | rolled_back"
+        value: ${{ jobs.verify-prod.outputs.result }}
+      url:
+        description: "The production base URL that was verified."
+        value: ${{ jobs.verify-prod.outputs.url }}
+
+permissions:
+  contents: write
+  issues: write
+
+jobs:
+  verify-prod:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      result: ${{ steps.result.outputs.result }}
+      url: ${{ steps.cfg.outputs.url }}
+    steps:
+      - name: resolve App token configuration
+        id: appcfg
+        env:
+          APP_ID: ${{ vars[inputs.app_id_var] }}
+          HAS_PRIVATE_KEY: ${{ secrets[inputs.private_key_secret] != '' }}
+        run: |
+          set -euo pipefail
+          if [ -n "$APP_ID" ] && [ "$HAS_PRIVATE_KEY" = "true" ]; then
+            echo "use_app=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "use_app=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::GitHub App not configured for this org — a rollback would push with GITHUB_TOKEN."
+          fi
+
+      - name: mint GitHub App token
+        id: app_token
+        if: steps.appcfg.outputs.use_app == 'true'
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ vars[inputs.app_id_var] }}
+          private-key: ${{ secrets[inputs.private_key_secret] }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          fetch-depth: 0
+          # Credentials are persisted by checkout, so the rollback push below
+          # uses this token — the App is the ruleset bypass actor for main.
+          token: ${{ steps.app_token.outputs.token || github.token }}
+
+      - name: compute production URL
+        id: cfg
+        env:
+          URL_IN: ${{ inputs.url }}
+          DOMAIN: ${{ inputs.domain }}
+        run: |
+          set -euo pipefail
+          if [ -n "$URL_IN" ]; then
+            URL="${URL_IN%/}"
+          else
+            if [ -z "$DOMAIN" ]; then
+              echo "::error::Enten «url» eller «domain» må settes."
+              exit 1
+            fi
+            REPO_NAME=${GITHUB_REPOSITORY##*/}
+            REPO_NAME=$(printf '%s' "$REPO_NAME" | tr '[:upper:]' '[:lower:]')
+            URL="https://${REPO_NAME}.${DOMAIN%/}"
+          fi
+          printf 'url=%s\n' "$URL" >> "$GITHUB_OUTPUT"
+          echo "Production base URL: $URL"
+
+      - name: verify production
+        id: verify
+        continue-on-error: true
+        env:
+          BASE_URL: ${{ steps.cfg.outputs.url }}
+          HEALTH_PATH: ${{ inputs.health_path }}
+          EXPECT_TAG: ${{ inputs.expect_tag }}
+          TIMEOUT_MINUTES: ${{ inputs.timeout_minutes }}
+        run: |
+          set -euo pipefail
+          HEALTH_URL="${BASE_URL}${HEALTH_PATH}"
+          deadline=$(( $(date +%s) + TIMEOUT_MINUTES * 60 ))
+          saw_200_at=""
+          reports_tag="unknown"
+
+          fail() {
+            printf 'ok=false\n' >> "$GITHUB_OUTPUT"
+            printf 'reason=%s\n' "$1" >> "$GITHUB_OUTPUT"
+            echo "$2"
+            exit 1
+          }
+
+          while :; do
+            code=$(curl -sS -o /tmp/health.json -w '%{http_code}' --max-time 15 "$HEALTH_URL" || echo 000)
+            if [ "$code" = "200" ]; then
+              [ -n "$saw_200_at" ] || saw_200_at=$(date +%s)
+              body_tag=$(jq -r 'if type == "object" and has("tag") then (.tag // "") else "" end' /tmp/health.json 2>/dev/null || echo "")
+              if [ -n "$body_tag" ]; then
+                reports_tag="yes"
+                if [ "$body_tag" = "$EXPECT_TAG" ]; then
+                  echo "Health endpoint reports tag=$body_tag (matches the tag we deployed)."
+                  break
+                fi
+                echo "Health 200 but tag=$body_tag, waiting for $EXPECT_TAG ..."
+              else
+                reports_tag="no"
+                # Without a tag field we cannot distinguish old from new, so give
+                # ArgoCD sync + the rollout 90s after the first 200, then re-check.
+                now=$(date +%s)
+                if [ $(( now - saw_200_at )) -ge 90 ]; then
+                  recheck=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 15 "$HEALTH_URL" || echo 000)
+                  if [ "$recheck" = "200" ]; then
+                    echo "::warning::health endpoint does not report tag; verified reachability only"
+                    break
+                  fi
+                  echo "Settled but re-check returned $recheck, continuing to poll ..."
+                  saw_200_at=""
+                else
+                  echo "Health 200 but no tag field; settling ($(( now - saw_200_at ))s/90s) ..."
+                fi
+              fi
+            else
+              echo "Health $code, retrying ..."
+            fi
+
+            if [ "$(date +%s)" -ge "$deadline" ]; then
+              fail "helsesjekk" "Timed out waiting for ${HEALTH_URL} to serve tag ${EXPECT_TAG} (last HTTP ${code})."
+            fi
+            sleep 10
+          done
+
+          root_code=$(curl -sSL -o /tmp/root.html -w '%{http_code}' --max-time 30 "${BASE_URL}/" || echo 000)
+          if [ "$root_code" != "200" ] || [ ! -s /tmp/root.html ]; then
+            fail "forside" "GET ${BASE_URL}/ returned HTTP ${root_code} (body $( [ -s /tmp/root.html ] && echo non-empty || echo empty ))."
+          fi
+
+          printf 'ok=true\n' >> "$GITHUB_OUTPUT"
+          printf 'reports_tag=%s\n' "$reports_tag" >> "$GITHUB_OUTPUT"
+
+      - name: decide on rollback
+        id: plan
+        env:
+          OK: ${{ steps.verify.outputs.ok }}
+          ROLLBACK: ${{ inputs.rollback }}
+          PREVIOUS_TAG: ${{ inputs.previous_tag }}
+          EXPECT_TAG: ${{ inputs.expect_tag }}
+        run: |
+          set -euo pipefail
+          do_rollback=false
+          if [ "$OK" != "true" ] && [ "$ROLLBACK" = "true" ] \
+             && [ -n "$PREVIOUS_TAG" ] && [ "$PREVIOUS_TAG" != "$EXPECT_TAG" ]; then
+            do_rollback=true
+          fi
+          printf 'do_rollback=%s\n' "$do_rollback" >> "$GITHUB_OUTPUT"
+          if [ "$OK" != "true" ] && [ "$do_rollback" != "true" ]; then
+            echo "::notice::Verification failed but no rollback is possible (rollback=$ROLLBACK, previous_tag='$PREVIOUS_TAG')."
+          fi
+
+      - name: roll the prod manifest back
+        id: rollback
+        if: steps.plan.outputs.do_rollback == 'true'
+        env:
+          PREVIOUS_TAG: ${{ inputs.previous_tag }}
+          IMAGE_NAME: ${{ inputs.image_name }}
+          MANIFEST: ${{ inputs.manifest_path }}
+          BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+
+          if [ -n "$IMAGE_NAME" ]; then
+            yq -i '(.images[] | select(.name == strenv(IMAGE_NAME)) | .newTag) = strenv(PREVIOUS_TAG)' "$MANIFEST"
+          else
+            sed -i "s|newTag: .*|newTag: $PREVIOUS_TAG|" "$MANIFEST"
+          fi
+
+          git config user.email "manifest-bot@logiskbrist.no"
+          git config user.name "manifest-bot"
+          git add "$MANIFEST"
+          if git diff --cached --quiet; then
+            echo "::notice::prod manifest is already at $PREVIOUS_TAG, nothing to push."
+            exit 0
+          fi
+          git commit -m "rollback: pin prod image to $PREVIOUS_TAG (verify-prod failed)"
+
+          attempts=0
+          until git push origin "HEAD:$BRANCH"; do
+            attempts=$((attempts + 1))
+            if [ $attempts -ge 3 ]; then
+              echo "::error::rollback push to $BRANCH failed after 3 attempts"
+              exit 1
+            fi
+            echo "push rejected, rebasing and retrying (attempt $attempts)..."
+            git pull --rebase origin "$BRANCH"
+          done
+
+      - name: open a rollback issue
+        if: always() && steps.rollback.outcome == 'success'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PREVIOUS_TAG: ${{ inputs.previous_tag }}
+          EXPECT_TAG: ${{ inputs.expect_tag }}
+          REASON: ${{ steps.verify.outputs.reason }}
+          BASE_URL: ${{ steps.cfg.outputs.url }}
+        run: |
+          set -euo pipefail
+          REPO_NAME=${GITHUB_REPOSITORY##*/}
+          RUN_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          case "$REASON" in
+            helsesjekk) WHAT="Appen svarte ikke slik den skulle etter publiseringen." ;;
+            forside)    WHAT="Forsiden i appen svarte ikke slik den skulle etter publiseringen." ;;
+            *)          WHAT="Kontrollen etter publiseringen feilet." ;;
+          esac
+
+          {
+            echo "Publiseringen av **$REPO_NAME** ble automatisk rullet tilbake."
+            echo ""
+            echo "**Hva skjedde:** $WHAT"
+            echo ""
+            echo "- Adresse: $BASE_URL"
+            echo "- Versjonen som ble publisert: \`$EXPECT_TAG\`"
+            echo "- Versjonen appen er satt tilbake til: \`$PREVIOUS_TAG\`"
+            echo ""
+            echo "Appen kjører nå på den forrige versjonen igjen. Ingenting er tapt — endringene ligger fortsatt lagret."
+            echo ""
+            echo "Detaljert logg: $RUN_URL"
+          } > /tmp/issue.md
+
+          gh issue create --repo "$GITHUB_REPOSITORY" \
+            --title "Publisering rullet tilbake: $REPO_NAME" \
+            --body-file /tmp/issue.md
+
+      - name: summarise
+        id: result
+        if: always()
+        env:
+          OK: ${{ steps.verify.outputs.ok }}
+          REPORTS_TAG: ${{ steps.verify.outputs.reports_tag }}
+          ROLLED_BACK: ${{ steps.rollback.outcome }}
+          BASE_URL: ${{ steps.cfg.outputs.url }}
+        run: |
+          set -euo pipefail
+          {
+            echo "### Publisering"
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$OK" = "true" ]; then
+            {
+              if [ "$REPORTS_TAG" = "yes" ]; then
+                echo "- ✓ Appen er oppe og kjører den nye versjonen."
+              else
+                echo "- ✓ Appen svarer (appen rapporterer ikke versjon, så vi bekreftet bare at den er oppe)."
+              fi
+              echo "- ✓ Forsiden lastet."
+              echo ""
+              echo "Appen er publisert: $BASE_URL"
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "result=ok" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [ "$ROLLED_BACK" = "success" ]; then
+            {
+              echo "- ✗ Appen svarte ikke slik den skulle etter publiseringen."
+              echo "- ✓ Appen er satt tilbake til forrige versjon."
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "result=rolled_back" >> "$GITHUB_OUTPUT"
+            echo "::error::Publiseringen feilet. Appen er satt tilbake til forrige versjon."
+          else
+            {
+              echo "- ✗ Appen svarte ikke slik den skulle etter publiseringen."
+              echo "- ✗ Klarte ikke å sette appen tilbake til forrige versjon."
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "result=failed" >> "$GITHUB_OUTPUT"
+            echo "::error::Publiseringen feilet, og appen kunne ikke settes tilbake automatisk. Ta kontakt med Logisk Brist."
+          fi
+          exit 1

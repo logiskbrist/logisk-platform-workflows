@@ -1,0 +1,345 @@
+name: verify-preview
+# Verifies that the preview environment for a PR is actually serving the image
+# the preview manifest points at, then runs whatever tests the app ships.
+#
+# The job id MUST stay `verify-preview` — the org ruleset requires the
+# `verify-preview / verify-preview` check context on customer app repos.
+on:
+  workflow_call:
+    inputs:
+      url:
+        required: false
+        type: string
+        default: ''
+        description: "Full base URL of the preview environment, e.g. https://my-branch-my-app.example.no. If empty, computed from `domain`."
+      domain:
+        required: false
+        type: string
+        default: ''
+        description: "Preview wildcard domain. The URL becomes https://<branch-slug>-<repo-name>.<domain>."
+      health_path:
+        required: false
+        type: string
+        default: /api/health
+      timeout_minutes:
+        required: false
+        type: number
+        default: 8
+      manifest_path:
+        required: false
+        type: string
+        default: manifests/preview/kustomization.yaml
+      run_tests:
+        required: false
+        type: boolean
+        default: true
+        description: "Run the app's `test` npm script against the preview URL, if it has one."
+      playwright_dir:
+        required: false
+        type: string
+        default: verify
+        description: "Directory holding a Playwright config. Skipped when absent."
+    outputs:
+      url:
+        description: "The preview base URL that was verified."
+        value: ${{ jobs.verify-preview.outputs.url }}
+      tag:
+        description: "The image tag read from the preview manifest."
+        value: ${{ jobs.verify-preview.outputs.tag }}
+      result:
+        description: "ok | failed | skipped"
+        value: ${{ jobs.verify-preview.outputs.result }}
+
+permissions:
+  contents: read
+
+jobs:
+  verify-preview:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      url: ${{ steps.cfg.outputs.url }}
+      tag: ${{ steps.manifest.outputs.tag }}
+      result: ${{ steps.result.outputs.result }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # On pull_request this is already the PR head; be explicit anyway so
+          # the workflow behaves the same when a caller triggers it on push.
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+
+      - name: compute preview URL
+        id: cfg
+        env:
+          URL_IN: ${{ inputs.url }}
+          DOMAIN: ${{ inputs.domain }}
+          BRANCH: ${{ github.head_ref || github.ref_name }}
+        run: |
+          set -euo pipefail
+          if [ -n "$URL_IN" ]; then
+            URL="${URL_IN%/}"
+          else
+            if [ -z "$DOMAIN" ]; then
+              echo "::error::Enten «url» eller «domain» må settes."
+              exit 1
+            fi
+            # Mirror the ArgoCD PullRequest generator's `branch_slug`: lowercase,
+            # every char outside [a-z0-9-] becomes '-', leading/trailing '-'
+            # trimmed, then truncated to 50 chars (and re-trimmed, so the slug
+            # can never end on the '-' the cut introduced).
+            SLUG=$(printf '%s' "$BRANCH" \
+              | tr '[:upper:]' '[:lower:]' \
+              | sed -e 's/[^a-z0-9-]/-/g' -e 's/^-*//' -e 's/-*$//' \
+              | cut -c1-50 \
+              | sed -e 's/-*$//')
+            REPO_NAME=${GITHUB_REPOSITORY##*/}
+            REPO_NAME=$(printf '%s' "$REPO_NAME" | tr '[:upper:]' '[:lower:]')
+            URL="https://${SLUG}-${REPO_NAME}.${DOMAIN%/}"
+          fi
+          printf 'url=%s\n' "$URL" >> "$GITHUB_OUTPUT"
+          echo "Preview base URL: $URL"
+
+      - name: read preview manifest tag
+        id: manifest
+        env:
+          MANIFEST: ${{ inputs.manifest_path }}
+        run: |
+          set -euo pipefail
+          TAG=""
+          if [ -f "$MANIFEST" ]; then
+            TAG=$(sed -n 's/^[[:space:]]*newTag:[[:space:]]*//p' "$MANIFEST" | head -n1 | tr -d "\"' ")
+          fi
+          printf 'tag=%s\n' "$TAG" >> "$GITHUB_OUTPUT"
+          if [ -z "$TAG" ] || [ "$TAG" = "PLACEHOLDER_TAG" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "No preview image yet (newTag='$TAG') — nothing to verify."
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            echo "Expecting preview to serve image tag: $TAG"
+          fi
+
+      - name: skip notice
+        if: steps.manifest.outputs.skip == 'true'
+        run: |
+          set -euo pipefail
+          {
+            echo "### Testversjon"
+            echo ""
+            echo "- ⏭️ Ingen testversjon er bygget ennå — hopper over kontrollen."
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "no preview image yet, skipping"
+
+      - name: wait for preview to serve the new image
+        if: steps.manifest.outputs.skip != 'true'
+        env:
+          BASE_URL: ${{ steps.cfg.outputs.url }}
+          HEALTH_PATH: ${{ inputs.health_path }}
+          EXPECT_TAG: ${{ steps.manifest.outputs.tag }}
+          TIMEOUT_MINUTES: ${{ inputs.timeout_minutes }}
+        run: |
+          set -euo pipefail
+          HEALTH_URL="${BASE_URL}${HEALTH_PATH}"
+          deadline=$(( $(date +%s) + TIMEOUT_MINUTES * 60 ))
+          saw_200_at=""
+          reports_tag="unknown"
+
+          while :; do
+            code=$(curl -sS -o /tmp/health.json -w '%{http_code}' --max-time 15 "$HEALTH_URL" || echo 000)
+            if [ "$code" = "200" ]; then
+              [ -n "$saw_200_at" ] || saw_200_at=$(date +%s)
+              body_tag=$(jq -r 'if type == "object" and has("tag") then (.tag // "") else "" end' /tmp/health.json 2>/dev/null || echo "")
+              if [ -n "$body_tag" ]; then
+                reports_tag="yes"
+                if [ "$body_tag" = "$EXPECT_TAG" ]; then
+                  echo "Health endpoint reports tag=$body_tag (matches manifest)."
+                  break
+                fi
+                echo "Health 200 but tag=$body_tag, waiting for $EXPECT_TAG ..."
+              else
+                reports_tag="no"
+                # No tag field: we cannot tell old image from new. Give ArgoCD +
+                # the rollout an extra 60s after the first 200, then accept.
+                now=$(date +%s)
+                if [ $(( now - saw_200_at )) -ge 60 ]; then
+                  echo "::warning::health endpoint does not report tag; verified reachability only"
+                  break
+                fi
+                echo "Health 200 but no tag field; settling ($(( now - saw_200_at ))s/60s) ..."
+              fi
+            else
+              echo "Health $code, retrying ..."
+            fi
+
+            if [ "$(date +%s)" -ge "$deadline" ]; then
+              {
+                echo "### Testversjon"
+                echo ""
+                echo "- ✗ Testversjonen svarte ikke i tide (${TIMEOUT_MINUTES} min)."
+              } >> "$GITHUB_STEP_SUMMARY"
+              echo "::error::Testversjonen svarte ikke i tide. Prøv å publisere på nytt."
+              echo "Timed out waiting for ${HEALTH_URL} to serve tag ${EXPECT_TAG} (last HTTP ${code})."
+              exit 1
+            fi
+            sleep 10
+          done
+
+          if [ "$reports_tag" = "yes" ]; then
+            echo "- ✓ Testversjonen er oppe og kjører den nye versjonen." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "- ✓ Testversjonen svarer (appen rapporterer ikke versjon, så vi bekreftet bare at den er oppe)." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: check the front page loads
+        if: steps.manifest.outputs.skip != 'true'
+        env:
+          BASE_URL: ${{ steps.cfg.outputs.url }}
+        run: |
+          set -euo pipefail
+          code=$(curl -sSL -o /tmp/root.html -w '%{http_code}' --max-time 30 "${BASE_URL}/" || echo 000)
+          if [ "$code" != "200" ]; then
+            echo "- ✗ Forsiden svarte ikke som forventet." >> "$GITHUB_STEP_SUMMARY"
+            echo "::error::Forsiden i testversjonen svarte ikke som forventet."
+            echo "GET ${BASE_URL}/ returned HTTP ${code}."
+            exit 1
+          fi
+          if [ ! -s /tmp/root.html ]; then
+            echo "- ✗ Forsiden svarte, men uten innhold." >> "$GITHUB_STEP_SUMMARY"
+            echo "::error::Forsiden i testversjonen ga tomt svar."
+            exit 1
+          fi
+          if grep -qi '<html' /tmp/root.html; then
+            echo "- ✓ Forsiden lastet." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "::warning::root did not return HTML; accepted as an API response (200 with a non-empty body)"
+            echo "- ✓ Appen svarer på forsiden (som et API, ikke en nettside)." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: detect test runners
+        id: pm
+        if: steps.manifest.outputs.skip != 'true'
+        env:
+          RUN_TESTS: ${{ inputs.run_tests }}
+          PLAYWRIGHT_DIR: ${{ inputs.playwright_dir }}
+        run: |
+          set -euo pipefail
+          pm=""
+          run_tests=false
+          run_playwright=false
+
+          if [ -f pnpm-lock.yaml ]; then pm=pnpm
+          elif [ -f yarn.lock ]; then pm=yarn
+          elif [ -f package-lock.json ]; then pm=npm
+          elif [ -f package.json ]; then pm=npm
+          fi
+
+          if [ "$RUN_TESTS" = "true" ] && [ -f package.json ] \
+             && jq -e '.scripts.test // empty' package.json >/dev/null 2>&1; then
+            run_tests=true
+          fi
+
+          if [ -d "$PLAYWRIGHT_DIR" ] && \
+             ls "$PLAYWRIGHT_DIR"/playwright.config.* >/dev/null 2>&1; then
+            run_playwright=true
+          fi
+
+          needs_node=false
+          if [ "$run_tests" = "true" ] || [ "$run_playwright" = "true" ]; then
+            needs_node=true
+          fi
+
+          {
+            printf 'pm=%s\n' "${pm:-npm}"
+            printf 'run_tests=%s\n' "$run_tests"
+            printf 'run_playwright=%s\n' "$run_playwright"
+            printf 'needs_node=%s\n' "$needs_node"
+          } >> "$GITHUB_OUTPUT"
+          echo "package manager=${pm:-none} tests=$run_tests playwright=$run_playwright"
+
+      - name: enable pnpm
+        if: steps.pm.outputs.needs_node == 'true' && steps.pm.outputs.pm == 'pnpm'
+        run: |
+          set -euo pipefail
+          corepack enable
+          corepack prepare pnpm@10 --activate
+
+      - uses: actions/setup-node@v4
+        if: steps.pm.outputs.needs_node == 'true'
+        with:
+          node-version: 24
+          cache: ${{ steps.pm.outputs.pm }}
+
+      - name: install dependencies
+        if: steps.pm.outputs.needs_node == 'true'
+        env:
+          PM: ${{ steps.pm.outputs.pm }}
+        run: |
+          set -euo pipefail
+          case "$PM" in
+            pnpm) pnpm install --frozen-lockfile ;;
+            yarn) yarn install --frozen-lockfile ;;
+            npm)  if [ -f package-lock.json ]; then npm ci; else npm install --no-audit --no-fund; fi ;;
+            *) echo "::error::ukjent pakkebehandler: $PM"; exit 1 ;;
+          esac
+
+      - name: run the app's tests
+        if: steps.pm.outputs.run_tests == 'true'
+        env:
+          PM: ${{ steps.pm.outputs.pm }}
+          BASE_URL: ${{ steps.cfg.outputs.url }}
+          PREVIEW_URL: ${{ steps.cfg.outputs.url }}
+        run: |
+          set -euo pipefail
+          case "$PM" in
+            pnpm) pnpm run test ;;
+            yarn) yarn run test ;;
+            *)    npm run test ;;
+          esac
+
+      - name: report test result
+        if: always() && steps.pm.outputs.run_tests == 'true'
+        run: |
+          set -euo pipefail
+          if [ "${{ job.status }}" = "success" ]; then
+            echo "- ✓ Appens egne tester gikk gjennom." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "- ✗ Appens egne tester feilet." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: install Playwright browser
+        if: steps.pm.outputs.run_playwright == 'true'
+        run: npx playwright install --with-deps chromium
+
+      - name: run Playwright checks
+        if: steps.pm.outputs.run_playwright == 'true'
+        env:
+          BASE_URL: ${{ steps.cfg.outputs.url }}
+          PREVIEW_URL: ${{ steps.cfg.outputs.url }}
+          PLAYWRIGHT_DIR: ${{ inputs.playwright_dir }}
+        run: npx playwright test -c "$PLAYWRIGHT_DIR"
+
+      - name: summarise
+        id: result
+        if: always()
+        env:
+          SKIPPED: ${{ steps.manifest.outputs.skip }}
+          PLAYWRIGHT: ${{ steps.pm.outputs.run_playwright }}
+        run: |
+          set -euo pipefail
+          if [ "$SKIPPED" = "true" ]; then
+            echo "result=skipped" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ "$PLAYWRIGHT" = "true" ]; then
+            if [ "${{ job.status }}" = "success" ]; then
+              echo "- ✓ Nettleserkontrollene gikk gjennom." >> "$GITHUB_STEP_SUMMARY"
+            else
+              echo "- ✗ Nettleserkontrollene feilet." >> "$GITHUB_STEP_SUMMARY"
+            fi
+          fi
+          if [ "${{ job.status }}" = "success" ]; then
+            echo "result=ok" >> "$GITHUB_OUTPUT"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "Testversjonen er klar: ${{ steps.cfg.outputs.url }}" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "result=failed" >> "$GITHUB_OUTPUT"
+          fi

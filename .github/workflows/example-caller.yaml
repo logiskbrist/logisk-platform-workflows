@@ -1,11 +1,26 @@
 # NOT a reusable workflow. This is a copy-paste template of what a customer app repo
 # needs at .github/workflows/build.yaml (or similar) to consume the reusable workflows
 # in this repo.
+#
+# This file covers building and publishing. Two more caller files go alongside it:
+#   - .github/workflows/checks.yaml       → example-checks.yaml (PR checks)
+#   - .github/workflows/review-gate.yaml  → example-review-gate.yaml (critical apps)
+# They live in separate files because they run on different events: the PR checks
+# need `pull_request`, and the gate additionally needs `pull_request_review`.
+#
+# `paths-ignore: manifests/**` on BOTH triggers is load-bearing. The manifest
+# bump is pushed with the GitHub App token, which — unlike GITHUB_TOKEN — does
+# trigger workflows. Without paths-ignore, that push would rebuild, bump again,
+# and loop forever. Do NOT copy paths-ignore into checks.yaml or
+# review-gate.yaml: those *must* re-run on the bump commit, because that is the
+# commit carrying the image the checks are meant to verify.
 name: build
 on:
   push:
     branches: [main]
+    paths-ignore: [manifests/**]
   pull_request:
+    paths-ignore: [manifests/**]
 
 jobs:
   build:
@@ -23,6 +38,19 @@ jobs:
     uses: PLACEHOLDER_CUSTOMERORG/logisk-platform-workflows/.github/workflows/update-prod-manifest.yaml@v1
     with:
       image_tag: ${{ needs.build.outputs.tag }}
+    secrets: inherit
+
+  # Waits for prod to actually serve the tag we just deployed. If it doesn't,
+  # the prod manifest is pinned back to `previous_tag` and an issue is opened.
+  verify-prod:
+    needs: [build, bump-prod]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    uses: PLACEHOLDER_CUSTOMERORG/logisk-platform-workflows/.github/workflows/verify-prod.yaml@v1
+    with:
+      domain: PLACEHOLDER_CUSTOMER_DOMAIN
+      expect_tag: ${{ needs.build.outputs.tag }}
+      previous_tag: ${{ needs.bump-prod.outputs.previous_tag }}
+    secrets: inherit
 
   bump-preview:
     needs: build
@@ -30,3 +58,4 @@ jobs:
     uses: PLACEHOLDER_CUSTOMERORG/logisk-platform-workflows/.github/workflows/update-preview-manifest.yaml@v1
     with:
       image_tag: ${{ needs.build.outputs.tag }}
+    secrets: inherit

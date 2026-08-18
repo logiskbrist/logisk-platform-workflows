@@ -1,0 +1,690 @@
+name: lb-review-gate
+# The "Logisk Brist review gate" for critical customer apps.
+#
+# Only repos marked critical (topic or custom property) are gated. On those, a
+# change that touches auth, the data model, money, platform glue, or secrets is
+# held until someone on the reviewer team approves it.
+#
+# The job id MUST stay `lb-review-gate` — the org ruleset requires the
+# `lb-review-gate / lb-review-gate` check context on customer app repos.
+#
+# Callers must trigger this on BOTH `pull_request` (opened, synchronize,
+# reopened, ready_for_review) and `pull_request_review` (submitted, dismissed);
+# `github.event.pull_request.number` is present on both.
+on:
+  workflow_call:
+    inputs:
+      pr_number:
+        required: false
+        type: string
+        default: ''
+      reviewer_team:
+        required: false
+        type: string
+        default: logiskbrist-reviewers
+        description: "Team slug (in the calling repo's org) whose approval unblocks the gate."
+      critical_topic:
+        required: false
+        type: string
+        default: logisk-critical
+      property_name:
+        required: false
+        type: string
+        default: criticality
+      property_value:
+        required: false
+        type: string
+        default: critical
+      label:
+        required: false
+        type: string
+        default: needs-lb-review
+      sensitive_paths:
+        required: false
+        type: string
+        default: ''
+        description: "Multiline `kategori:glob` list overriding the built-in one. Lines without a colon fall into the 'annet' category."
+      semantic_model:
+        required: false
+        type: string
+        default: claude-sonnet-5
+      api_key_secret:
+        required: false
+        type: string
+        default: ANTHROPIC_API_KEY
+      preview_url:
+        required: false
+        type: string
+        default: ''
+        description: "Preview URL to link from the review comment, if the caller knows it."
+      app_id_var:
+        required: false
+        type: string
+        default: LOGISK_GH_APP_ID
+      installation_id_var:
+        required: false
+        type: string
+        default: LOGISK_GH_APP_INSTALLATION_ID
+      private_key_secret:
+        required: false
+        type: string
+        default: LOGISK_GH_APP_PRIVATE_KEY
+    outputs:
+      critical:
+        description: "true when the repo is marked as a critical app."
+        value: ${{ jobs.lb-review-gate.outputs.critical }}
+      sensitive:
+        description: "true when this change touches a sensitive area."
+        value: ${{ jobs.lb-review-gate.outputs.sensitive }}
+      approved:
+        description: "true when a reviewer-team member approved after the last human commit."
+        value: ${{ jobs.lb-review-gate.outputs.approved }}
+      reasons:
+        description: "Compact JSON array of the reasons the change was flagged."
+        value: ${{ jobs.lb-review-gate.outputs.reasons }}
+
+permissions:
+  contents: read
+  pull-requests: write
+  # Labels and PR comments go through the issues API. The App token covers this
+  # via Pull requests: RW; the GITHUB_TOKEN fallback needs it spelled out.
+  issues: write
+
+jobs:
+  lb-review-gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      critical: ${{ steps.critical.outputs.critical }}
+      sensitive: ${{ steps.classify.outputs.sensitive || 'false' }}
+      approved: ${{ steps.approval.outputs.approved || 'false' }}
+      reasons: ${{ steps.classify.outputs.reasons || '[]' }}
+    steps:
+      # The App token is what lets us request a review from an org team and read
+      # that team's membership — GITHUB_TOKEN can do neither.
+      - name: resolve App token configuration
+        id: appcfg
+        env:
+          APP_ID: ${{ vars[inputs.app_id_var] }}
+          HAS_PRIVATE_KEY: ${{ secrets[inputs.private_key_secret] != '' }}
+          HAS_API_KEY: ${{ secrets[inputs.api_key_secret] != '' }}
+        run: |
+          set -euo pipefail
+          if [ -n "$APP_ID" ] && [ "$HAS_PRIVATE_KEY" = "true" ]; then
+            echo "use_app=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "use_app=false" >> "$GITHUB_OUTPUT"
+          fi
+          printf 'has_api_key=%s\n' "$HAS_API_KEY" >> "$GITHUB_OUTPUT"
+
+      - name: mint GitHub App token
+        id: app_token
+        if: steps.appcfg.outputs.use_app == 'true'
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ vars[inputs.app_id_var] }}
+          private-key: ${{ secrets[inputs.private_key_secret] }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+
+      - name: is this a critical app?
+        id: critical
+        env:
+          GH_TOKEN: ${{ steps.app_token.outputs.token || github.token }}
+          TOPIC: ${{ inputs.critical_topic }}
+          PROPERTY_NAME: ${{ inputs.property_name }}
+          PROPERTY_VALUE: ${{ inputs.property_value }}
+        run: |
+          set -euo pipefail
+          CRITICAL=false
+
+          TOPICS=$(gh repo view "$GITHUB_REPOSITORY" --json repositoryTopics \
+            --jq '[.repositoryTopics[]?.name] | join(" ")' 2>/dev/null || echo "")
+          for t in $TOPICS; do
+            if [ "$t" = "$TOPIC" ]; then CRITICAL=true; fi
+          done
+
+          if [ "$CRITICAL" != "true" ]; then
+            # Custom properties may be unreadable (404/403) depending on org
+            # settings — that is not an error, just "no signal from here".
+            VALUE=$(gh api "repos/$GITHUB_REPOSITORY/properties/values" 2>/dev/null \
+              | jq -r --arg n "$PROPERTY_NAME" \
+                  'if type == "array" then (.[] | select(.property_name == $n) | .value) else empty end' \
+              2>/dev/null || echo "")
+            if [ "$VALUE" = "$PROPERTY_VALUE" ]; then CRITICAL=true; fi
+          fi
+
+          printf 'critical=%s\n' "$CRITICAL" >> "$GITHUB_OUTPUT"
+          if [ "$CRITICAL" != "true" ]; then
+            {
+              echo "### Godkjenning fra Logisk Brist"
+              echo ""
+              echo "Denne appen er ikke merket som en kritisk app — ingen godkjenning kreves."
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - uses: actions/checkout@v4
+        if: steps.critical.outputs.critical == 'true'
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+
+      - name: resolve PR number
+        id: pr
+        if: steps.critical.outputs.critical == 'true'
+        env:
+          GH_TOKEN: ${{ steps.app_token.outputs.token || github.token }}
+          PR_IN: ${{ inputs.pr_number }}
+          EVENT_PR: ${{ github.event.pull_request.number }}
+          BRANCH: ${{ github.head_ref || github.ref_name }}
+        run: |
+          set -euo pipefail
+          PR="$PR_IN"
+          [ -n "$PR" ] || PR="$EVENT_PR"
+          if [ -z "$PR" ]; then
+            PR=$(gh pr list --repo "$GITHUB_REPOSITORY" --head "$BRANCH" --json number --jq '.[0].number // ""')
+          fi
+          if [ -z "$PR" ]; then
+            echo "::error::Fant ingen publisering å vurdere."
+            echo "Could not resolve a PR number from inputs, the event, or branch '$BRANCH'."
+            exit 1
+          fi
+          printf 'number=%s\n' "$PR" >> "$GITHUB_OUTPUT"
+
+      - name: classify changed paths
+        id: paths
+        if: steps.critical.outputs.critical == 'true'
+        env:
+          GH_TOKEN: ${{ steps.app_token.outputs.token || github.token }}
+          PR: ${{ steps.pr.outputs.number }}
+          SENSITIVE_PATHS: ${{ inputs.sensitive_paths }}
+        run: |
+          set -euo pipefail
+          gh pr diff "$PR" --repo "$GITHUB_REPOSITORY" --name-only > /tmp/names.txt
+          gh pr diff "$PR" --repo "$GITHUB_REPOSITORY" > /tmp/pr.diff
+
+          python3 - <<'PY'
+          import json, os, re
+
+          BUILTIN = [
+              ("tilgang", "**/auth/**"),
+              ("tilgang", "**/auth.*"),
+              ("tilgang", "**/auth-*"),
+              ("tilgang", "middleware.ts"),
+              ("tilgang", "app/api/auth/**"),
+              ("tilgang", "**/casl*"),
+              ("tilgang", "**/permission*"),
+              ("tilgang", "**/rbac*"),
+              ("tilgang", "**/session*"),
+              ("database", "prisma/schema.prisma"),
+              ("database", "prisma/migrations/**"),
+              ("database", "prisma.config.ts"),
+              ("database", "**/*.sql"),
+              ("database", "scripts/ensure-db*"),
+              ("betaling", "**/payment*"),
+              ("betaling", "**/vipps*"),
+              ("betaling", "**/stripe*"),
+              ("betaling", "**/invoice*"),
+              ("betaling", "**/pric*"),
+              ("betaling", "**/billing*"),
+              ("plattform", "Dockerfile"),
+              ("plattform", "manifests/**"),
+              ("plattform", ".github/workflows/**"),
+              ("plattform", "next.config.*"),
+              ("hemmeligheter", "**/env*.ts"),
+              ("hemmeligheter", ".env*"),
+          ]
+
+          # package.json only counts when the diff actually touches a dependency
+          # line for one of these packages.
+          DEP_RE = re.compile(
+              r"auth|prisma|jsonwebtoken|jose|crypto|passport|stripe|vipps|argon|bcrypt",
+              re.I,
+          )
+
+          def glob_body(pat: str) -> str:
+              out, i = [], 0
+              while i < len(pat):
+                  if pat.startswith("**/", i):
+                      out.append("(?:.*/)?"); i += 3
+                  elif pat.startswith("**", i):
+                      out.append(".*"); i += 2
+                  elif pat[i] == "*":
+                      out.append("[^/]*"); i += 1
+                  elif pat[i] == "?":
+                      out.append("[^/]"); i += 1
+                  else:
+                      out.append(re.escape(pat[i])); i += 1
+              return "".join(out)
+
+          def glob_re(pat: str) -> re.Pattern:
+              # Case-insensitive, and a pattern that names a directory also
+              # covers everything under it — so `**/payment*` flags
+              # app/(shop)/payment/page.tsx and `**/casl*` flags casl/ability.ts.
+              # Both widen the net on purpose: this gate errs toward flagging.
+              body = glob_body(pat)
+              return re.compile(f"^(?:{body})(?:/.*)?$", re.IGNORECASE)
+
+          override = os.environ.get("SENSITIVE_PATHS", "").strip()
+          rules = []
+          if override:
+              for raw in override.splitlines():
+                  line = raw.strip()
+                  if not line or line.startswith("#"):
+                      continue
+                  cat, sep, pat = line.partition(":")
+                  rules.append((cat.strip(), pat.strip()) if sep else ("annet", line))
+          else:
+              rules = list(BUILTIN)
+
+          matchers = [(cat, pat, glob_re(pat)) for cat, pat in rules]
+
+          names = [n.strip() for n in open("/tmp/names.txt", encoding="utf-8") if n.strip()]
+
+          def dep_lines_touched(path: str) -> bool:
+              """True when the diff hunk for `path` adds/removes a matching dep line."""
+              current, inside = None, False
+              with open("/tmp/pr.diff", encoding="utf-8", errors="replace") as fh:
+                  for line in fh:
+                      if line.startswith("diff --git "):
+                          m = re.match(r"diff --git a/(.*?) b/(.*)$", line.rstrip("\n"))
+                          current = (m.group(2) if m else "").strip()
+                          inside = current == path
+                          continue
+                      if not inside:
+                          continue
+                      if line[:1] in "+-" and not line.startswith(("+++", "---")):
+                          if DEP_RE.search(line):
+                              return True
+              return False
+
+          reasons = []
+          for path in names:
+              base = path.rsplit("/", 1)[-1]
+              for cat, pat, rx in matchers:
+                  if rx.match(path) or ("/" not in pat and rx.match(base)):
+                      reasons.append(f"{cat}: {path}")
+                      break
+              else:
+                  if base == "package.json" and dep_lines_touched(path):
+                      reasons.append(f"avhengigheter: {path}")
+
+          # De-duplicate while keeping order.
+          seen, ordered = set(), []
+          for r in reasons:
+              if r not in seen:
+                  seen.add(r)
+                  ordered.append(r)
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
+              out.write(f"path_sensitive={'true' if ordered else 'false'}\n")
+              out.write("path_reasons=" + json.dumps(ordered, ensure_ascii=False) + "\n")
+          print(f"{len(names)} changed files, {len(ordered)} path reason(s)")
+          for r in ordered:
+              print(f"  - {r}")
+          PY
+
+      - name: semantic classification
+        id: semantic
+        if: steps.critical.outputs.critical == 'true' && steps.paths.outputs.path_sensitive != 'true'
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets[inputs.api_key_secret] }}
+          HAS_API_KEY: ${{ steps.appcfg.outputs.has_api_key }}
+          MODEL: ${{ inputs.semantic_model }}
+          SYSTEM_PROMPT: |
+            You classify a code diff for a review gate on a critical production application.
+
+            A change is SENSITIVE if it adds, removes, or alters any of:
+            - authentication;
+            - authorization or role/permission checks;
+            - session handling;
+            - the data model or database migrations;
+            - payment or pricing logic;
+            - outbound data flows to a new host or third party;
+            - secret or environment-variable handling;
+            - CI, build, or deploy configuration.
+
+            Err strongly toward flagging. If you are unsure, flag it.
+
+            Respond with STRICT JSON only, no prose and no markdown fences:
+            {"sensitive": true, "reasons": ["short reason in Norwegian bokmål", "..."]}
+            Use an empty reasons array when nothing is sensitive.
+        run: |
+          set -euo pipefail
+
+          if [ "$HAS_API_KEY" != "true" ]; then
+            {
+              printf 'sensitive=false\n'
+              printf 'reasons=[]\n'
+              printf 'skipped=true\n'
+            } >> "$GITHUB_OUTPUT"
+            echo "::notice::ANTHROPIC_API_KEY not set — semantic check skipped, gate is path-only."
+            exit 0
+          fi
+
+          python3 - <<'PY'
+          import re
+          EXCLUDE = ["pnpm-lock.yaml", "package-lock.json", "yarn.lock",
+                     "manifests/**", "*.svg", "*.png"]
+
+          def glob_re(pat):
+              out, i = ["^"], 0
+              while i < len(pat):
+                  if pat.startswith("**/", i): out.append("(?:.*/)?"); i += 3
+                  elif pat.startswith("**", i): out.append(".*"); i += 2
+                  elif pat[i] == "*": out.append("[^/]*"); i += 1
+                  elif pat[i] == "?": out.append("[^/]"); i += 1
+                  else: out.append(re.escape(pat[i])); i += 1
+              out.append("$")
+              return re.compile("".join(out))
+
+          M = [(p, glob_re(p)) for p in EXCLUDE]
+
+          def excluded(path):
+              base = path.rsplit("/", 1)[-1]
+              return any(rx.match(path) or ("/" not in p and rx.match(base)) for p, rx in M)
+
+          blocks, current, path = [], None, None
+          with open("/tmp/pr.diff", encoding="utf-8", errors="replace") as fh:
+              for line in fh:
+                  if line.startswith("diff --git "):
+                      if current is not None and not excluded(path or ""):
+                          blocks.append("".join(current))
+                      m = re.match(r"diff --git a/(.*?) b/(.*)$", line.rstrip("\n"))
+                      path = (m.group(2) if m else "").strip()
+                      current = [line]
+                  elif current is not None:
+                      current.append(line)
+          if current is not None and not excluded(path or ""):
+              blocks.append("".join(current))
+
+          text = "".join(blocks)[:120000]
+          open("/tmp/gate.diff", "w", encoding="utf-8").write(text)
+          PY
+
+          if [ ! -s /tmp/gate.diff ]; then
+            {
+              printf 'sensitive=false\n'
+              printf 'reasons=[]\n'
+              printf 'skipped=false\n'
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+
+          USER=$(printf 'Classify this diff:\n\n<diff>\n'; cat /tmp/gate.diff; printf '\n</diff>\n')
+
+          jq -n --arg model "$MODEL" --arg system "$SYSTEM_PROMPT" --arg user "$USER" \
+            '{model: $model, max_tokens: 1500, system: $system,
+              messages: [{role: "user", content: $user}]}' > /tmp/req.json
+
+          # Retry transient failures (rate limit / overloaded / network) with
+          # backoff so a blip doesn't block a publish. 4xx other than 429 is final.
+          HTTP=000
+          for attempt in 1 2 3 4 5; do
+            HTTP=$(curl -sS -X POST https://api.anthropic.com/v1/messages \
+              -H "x-api-key: $ANTHROPIC_API_KEY" \
+              -H "anthropic-version: 2023-06-01" \
+              -H "content-type: application/json" \
+              --data @/tmp/req.json \
+              -o /tmp/resp.json -w '%{http_code}') || HTTP=000
+            case "$HTTP" in
+              200) break ;;
+              000|408|409|429|5*) echo "Anthropic API HTTP $HTTP (attempt $attempt/5), retrying..."; sleep $((attempt * 15)) ;;
+              *) break ;;
+            esac
+          done
+
+          # Fail closed: on a critical app, an unusable semantic check means a
+          # human has to look at it.
+          if [ "$HTTP" != "200" ]; then
+            echo "Anthropic API returned HTTP $HTTP; treating the change as sensitive."
+            {
+              printf 'sensitive=true\n'
+              printf 'reasons=["semantisk sjekk feilet — manuell godkjenning kreves"]\n'
+              printf 'skipped=false\n'
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          jq -r '[.content[] | select(.type == "text") | .text] | join("\n")' /tmp/resp.json > /tmp/text.out
+
+          python3 - <<'PY'
+          import json, os, re
+          raw = open("/tmp/text.out", encoding="utf-8").read().strip()
+          fence = re.match(r"^```(?:json)?\s*(.*?)\s*```$", raw, re.S)
+          if fence:
+              raw = fence.group(1).strip()
+          if not raw.startswith("{"):
+              s, e = raw.find("{"), raw.rfind("}")
+              if s != -1 and e > s:
+                  raw = raw[s:e + 1]
+          try:
+              data = json.loads(raw)
+              sensitive = bool(data.get("sensitive"))
+              reasons = [str(r) for r in (data.get("reasons") or [])]
+          except Exception as exc:
+              print(f"could not parse the model's answer ({exc}); failing closed")
+              sensitive, reasons = True, ["semantisk sjekk feilet — manuell godkjenning kreves"]
+          if sensitive and not reasons:
+              reasons = ["endringen ble vurdert som sensitiv"]
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
+              out.write(f"sensitive={'true' if sensitive else 'false'}\n")
+              out.write("reasons=" + json.dumps(reasons if sensitive else [], ensure_ascii=False) + "\n")
+              out.write("skipped=false\n")
+          PY
+
+      - name: combine classifications
+        id: classify
+        if: steps.critical.outputs.critical == 'true'
+        env:
+          PATH_SENSITIVE: ${{ steps.paths.outputs.path_sensitive }}
+          PATH_REASONS: ${{ steps.paths.outputs.path_reasons }}
+          SEM_SENSITIVE: ${{ steps.semantic.outputs.sensitive }}
+          SEM_REASONS: ${{ steps.semantic.outputs.reasons }}
+          SEM_SKIPPED: ${{ steps.semantic.outputs.skipped }}
+        run: |
+          set -euo pipefail
+          SENSITIVE=false
+          if [ "$PATH_SENSITIVE" = "true" ] || [ "$SEM_SENSITIVE" = "true" ]; then
+            SENSITIVE=true
+          fi
+          REASONS=$(jq -c -n \
+            --argjson a "${PATH_REASONS:-[]}" \
+            --argjson b "${SEM_REASONS:-[]}" \
+            '$a + $b | unique_by(.)')
+          {
+            printf 'sensitive=%s\n' "$SENSITIVE"
+            printf 'reasons=%s\n' "$REASONS"
+            printf 'semantic_skipped=%s\n' "${SEM_SKIPPED:-false}"
+          } >> "$GITHUB_OUTPUT"
+          echo "sensitive=$SENSITIVE reasons=$REASONS"
+
+      - name: clear the label (nothing sensitive)
+        if: steps.critical.outputs.critical == 'true' && steps.classify.outputs.sensitive != 'true'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ steps.app_token.outputs.token || github.token }}
+          PR: ${{ steps.pr.outputs.number }}
+          LABEL: ${{ inputs.label }}
+        run: |
+          set -euo pipefail
+          gh pr edit "$PR" --repo "$GITHUB_REPOSITORY" --remove-label "$LABEL" \
+            || echo "Label '$LABEL' was not set on #$PR."
+
+      - name: comment — nothing sensitive
+        if: steps.critical.outputs.critical == 'true' && steps.classify.outputs.sensitive != 'true'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ steps.app_token.outputs.token || github.token }}
+          PR: ${{ steps.pr.outputs.number }}
+          SEMANTIC_SKIPPED: ${{ steps.classify.outputs.semantic_skipped }}
+        run: |
+          set -euo pipefail
+          {
+            echo "### Godkjenning fra Logisk Brist"
+            echo ""
+            echo "Denne endringen berører ingen sensitive deler av appen. Den kan publiseres uten godkjenning fra Logisk Brist."
+            if [ "$SEMANTIC_SKIPPED" = "true" ]; then
+              echo ""
+              echo "_Merk: den automatiske innholdssjekken er ikke aktivert, så vurderingen bygger kun på hvilke filer som er endret._"
+            fi
+            echo ""
+            echo "<!-- lb-review-gate -->"
+          } > /tmp/comment.md
+          cat /tmp/comment.md >> "$GITHUB_STEP_SUMMARY"
+
+          gh api "repos/$GITHUB_REPOSITORY/issues/$PR/comments" --paginate --jq '.[]' \
+            | jq -s '[.[] | select(.body != null and (.body | contains("<!-- lb-review-gate -->")))] | last // empty' \
+            > /tmp/sticky.json
+          jq -n --rawfile body /tmp/comment.md '{body: $body}' > /tmp/comment.json
+          if [ -s /tmp/sticky.json ]; then
+            gh api --method PATCH "repos/$GITHUB_REPOSITORY/issues/comments/$(jq -r '.id' /tmp/sticky.json)" \
+              --input /tmp/comment.json >/dev/null
+          else
+            gh api --method POST "repos/$GITHUB_REPOSITORY/issues/$PR/comments" \
+              --input /tmp/comment.json >/dev/null
+          fi
+
+      - name: label, request review, and comment
+        if: steps.critical.outputs.critical == 'true' && steps.classify.outputs.sensitive == 'true'
+        env:
+          GH_TOKEN: ${{ steps.app_token.outputs.token || github.token }}
+          PR: ${{ steps.pr.outputs.number }}
+          LABEL: ${{ inputs.label }}
+          TEAM: ${{ inputs.reviewer_team }}
+          ORG: ${{ github.repository_owner }}
+          REASONS: ${{ steps.classify.outputs.reasons }}
+          PREVIEW_URL: ${{ inputs.preview_url }}
+          SEMANTIC_SKIPPED: ${{ steps.classify.outputs.semantic_skipped }}
+        run: |
+          set -euo pipefail
+
+          gh label create "$LABEL" --repo "$GITHUB_REPOSITORY" --force \
+            --color D93F0B \
+            --description "Krever godkjenning fra Logisk Brist før publisering" >/dev/null
+          gh pr edit "$PR" --repo "$GITHUB_REPOSITORY" --add-label "$LABEL" >/dev/null
+
+          # Idempotent: GitHub errors when the team is already a requested
+          # reviewer, which is exactly the state we want.
+          if ! gh pr edit "$PR" --repo "$GITHUB_REPOSITORY" --add-reviewer "$ORG/$TEAM" >/dev/null 2>&1; then
+            echo "::notice::Could not add $ORG/$TEAM as a reviewer (already requested, or the team is not visible to the App)."
+          fi
+
+          {
+            echo "### Godkjenning fra Logisk Brist"
+            echo ""
+            echo "Denne endringen berører deler av appen som må ses over av et menneske før den kan publiseres."
+            echo ""
+            echo "**Dette er flagget:**"
+            printf '%s' "$REASONS" | jq -r '.[] | "- " + .'
+            if [ -n "$PREVIEW_URL" ]; then
+              echo ""
+              echo "**Testversjon:** $PREVIEW_URL"
+            fi
+            echo ""
+            echo "**Godkjenning:** en godkjennende review fra @$ORG/$TEAM — deretter publiseres den automatisk."
+            echo ""
+            echo "<details><summary>Details for the reviewer (English)</summary>"
+            echo ""
+            echo "This repository is marked as a critical app, so \`lb-review-gate\` holds the PR until a member of \`@$ORG/$TEAM\` submits an approving review."
+            echo ""
+            echo "Flagged by:"
+            printf '%s' "$REASONS" | jq -r '.[] | "- `" + . + "`"'
+            if [ "$SEMANTIC_SKIPPED" = "true" ]; then
+              echo ""
+              echo "The semantic classifier was skipped (no \`ANTHROPIC_API_KEY\`); this verdict is path-based only."
+            fi
+            echo ""
+            echo "The approval must be submitted **after** the most recent commit that was not authored by the platform bot — a manifest bump does not invalidate it."
+            echo ""
+            echo "</details>"
+            echo ""
+            echo "<!-- lb-review-gate -->"
+          } > /tmp/comment.md
+          cat /tmp/comment.md >> "$GITHUB_STEP_SUMMARY"
+
+          gh api "repos/$GITHUB_REPOSITORY/issues/$PR/comments" --paginate --jq '.[]' \
+            | jq -s '[.[] | select(.body != null and (.body | contains("<!-- lb-review-gate -->")))] | last // empty' \
+            > /tmp/sticky.json
+          jq -n --rawfile body /tmp/comment.md '{body: $body}' > /tmp/comment.json
+          if [ -s /tmp/sticky.json ]; then
+            gh api --method PATCH "repos/$GITHUB_REPOSITORY/issues/comments/$(jq -r '.id' /tmp/sticky.json)" \
+              --input /tmp/comment.json >/dev/null
+          else
+            gh api --method POST "repos/$GITHUB_REPOSITORY/issues/$PR/comments" \
+              --input /tmp/comment.json >/dev/null
+          fi
+
+      - name: check for an approval
+        id: approval
+        if: steps.critical.outputs.critical == 'true' && steps.classify.outputs.sensitive == 'true'
+        env:
+          GH_TOKEN: ${{ steps.app_token.outputs.token || github.token }}
+          PR: ${{ steps.pr.outputs.number }}
+          TEAM: ${{ inputs.reviewer_team }}
+          ORG: ${{ github.repository_owner }}
+        run: |
+          set -euo pipefail
+
+          if ! gh api "orgs/$ORG/teams/$TEAM/members" --paginate --jq '.[].login' > /tmp/members.txt 2>/tmp/members.err; then
+            echo "::error::Fant ikke godkjenner-teamet — ta kontakt med Logisk Brist."
+            echo "Could not read members of team '$ORG/$TEAM'. The team must exist and the GitHub App must have Organization Members: Read."
+            sed -n '1,10p' /tmp/members.err || true
+            exit 1
+          fi
+          if [ ! -s /tmp/members.txt ]; then
+            echo "::error::Godkjenner-teamet har ingen medlemmer — ta kontakt med Logisk Brist."
+            echo "Team '$ORG/$TEAM' resolved but has no members."
+            exit 1
+          fi
+
+          # The newest commit NOT authored by the platform bot. A manifest bump
+          # must not invalidate an approval that was given for the human's work.
+          gh api "repos/$GITHUB_REPOSITORY/pulls/$PR/commits" --paginate --jq '.[]' \
+            | jq -s '.' > /tmp/commits.json
+          CUTOFF=$(jq -r '
+            [ .[]
+              | select(
+                  ((.author.login // "") | test("\\[bot\\]$") | not)
+                  and ((.author.login // "") != "manifest-bot")
+                  and ((.commit.author.name // "") != "manifest-bot")
+                  and ((.commit.author.email // "") | test("manifest-bot") | not)
+                )
+              | .commit.author.date ]
+            | sort | last // "1970-01-01T00:00:00Z"' /tmp/commits.json)
+          echo "Approval must be newer than $CUTOFF"
+
+          # Latest decisive review per user (COMMENTED/PENDING do not change the
+          # approval state, same as GitHub's own semantics).
+          gh api "repos/$GITHUB_REPOSITORY/pulls/$PR/reviews" --paginate --jq '.[]' \
+            | jq -s '.' > /tmp/reviews.json
+          jq -r --arg cutoff "$CUTOFF" '
+            [ .[]
+              | select(.user.login != null and .submitted_at != null)
+              | select(.state == "APPROVED" or .state == "CHANGES_REQUESTED" or .state == "DISMISSED") ]
+            | group_by(.user.login)
+            | map(max_by(.submitted_at))
+            | .[]
+            | select(.state == "APPROVED" and .submitted_at > $cutoff)
+            | .user.login' /tmp/reviews.json | sort -u > /tmp/approvers.txt
+
+          APPROVER=$(grep -Fx -f /tmp/members.txt /tmp/approvers.txt | head -n1 || true)
+
+          if [ -n "$APPROVER" ]; then
+            printf 'approved=true\n' >> "$GITHUB_OUTPUT"
+            printf 'approver=%s\n' "$APPROVER" >> "$GITHUB_OUTPUT"
+            {
+              echo ""
+              echo "Godkjent av $APPROVER"
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "Approved by $APPROVER"
+            exit 0
+          fi
+
+          printf 'approved=false\n' >> "$GITHUB_OUTPUT"
+          {
+            echo ""
+            echo "Venter på godkjenning fra Logisk Brist."
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "::error::Venter på godkjenning fra Logisk Brist"
+          exit 1
