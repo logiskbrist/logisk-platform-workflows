@@ -115,8 +115,36 @@ jobs:
           # uses this token — the App is the ruleset bypass actor for main.
           token: ${{ steps.app_token.outputs.token || github.token }}
 
+      # A brand-new app has nothing to verify yet: the platform only discovers a
+      # repo once it carries the `logisk-platform` topic, which /new-app adds AFTER
+      # this first build — and previous_tag is PLACEHOLDER_TAG, so a "rollback"
+      # would pin prod to a tag that doesn't exist. Skip cleanly instead.
+      - name: first deploy?
+        id: first
+        env:
+          GH_TOKEN: ${{ steps.app_token.outputs.token || github.token }}
+          PREVIOUS_TAG: ${{ inputs.previous_tag }}
+        run: |
+          set -euo pipefail
+          SKIP=false; WHY=""
+          if [ -z "$PREVIOUS_TAG" ] || [ "$PREVIOUS_TAG" = "PLACEHOLDER_TAG" ]; then
+            SKIP=true; WHY="første publisering (ingen tidligere versjon å sammenligne med)"
+          fi
+          TOPICS=$(gh repo view "$GITHUB_REPOSITORY" --json repositoryTopics --jq '[.repositoryTopics[]?.name] | join(" ")' 2>/dev/null || echo "")
+          case " $TOPICS " in *" logisk-platform "*) ;; *) SKIP=true; WHY="appen er ikke registrert på plattformen ennå (mangler topic logisk-platform)";; esac
+          printf 'skip=%s\n' "$SKIP" >> "$GITHUB_OUTPUT"
+          if [ "$SKIP" = "true" ]; then
+            {
+              echo "### Kontroll av publisering"
+              echo ""
+              echo "Hoppet over: $WHY. Neste publisering kontrolleres som normalt."
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "::notice::verify-prod skipped: $WHY"
+          fi
+
       - name: compute production URL
         id: cfg
+        if: steps.first.outputs.skip != 'true'
         env:
           URL_IN: ${{ inputs.url }}
           DOMAIN: ${{ inputs.domain }}
@@ -152,6 +180,7 @@ jobs:
 
       - name: verify production
         id: verify
+        if: steps.first.outputs.skip != 'true'
         continue-on-error: true
         env:
           BASE_URL: ${{ steps.cfg.outputs.url }}
@@ -221,6 +250,7 @@ jobs:
 
       - name: decide on rollback
         id: plan
+        if: steps.first.outputs.skip != 'true'
         env:
           OK: ${{ steps.verify.outputs.ok }}
           ROLLBACK: ${{ inputs.rollback }}
@@ -240,7 +270,7 @@ jobs:
 
       - name: roll the prod manifest back
         id: rollback
-        if: steps.plan.outputs.do_rollback == 'true'
+        if: steps.first.outputs.skip != 'true' && (steps.plan.outputs.do_rollback == 'true')
         env:
           PREVIOUS_TAG: ${{ inputs.previous_tag }}
           IMAGE_NAME: ${{ inputs.image_name }}
@@ -276,7 +306,7 @@ jobs:
           done
 
       - name: open a rollback issue
-        if: always() && steps.rollback.outcome == 'success'
+        if: steps.first.outputs.skip != 'true' && (always() && steps.rollback.outcome == 'success')
         continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
@@ -314,7 +344,7 @@ jobs:
 
       - name: summarise
         id: result
-        if: always()
+        if: steps.first.outputs.skip != 'true' && (always())
         env:
           OK: ${{ steps.verify.outputs.ok }}
           REPORTS_TAG: ${{ steps.verify.outputs.reports_tag }}
