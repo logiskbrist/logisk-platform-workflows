@@ -144,7 +144,7 @@ jobs:
           reports_tag="unknown"
 
           while :; do
-            code=$(curl -sS -o /tmp/health.json -w '%{http_code}' --max-time 15 "$HEALTH_URL" || echo 000)
+            code=$(curl -sS -o /tmp/health.json -w '%{http_code}' --max-time 15 "$HEALTH_URL" 2>/dev/null || true); code=${code:-000}
             if [ "$code" = "200" ]; then
               [ -n "$saw_200_at" ] || saw_200_at=$(date +%s)
               body_tag=$(jq -r 'if type == "object" and has("tag") then (.tag // "") else "" end' /tmp/health.json 2>/dev/null || echo "")
@@ -195,7 +195,7 @@ jobs:
           BASE_URL: ${{ steps.cfg.outputs.url }}
         run: |
           set -euo pipefail
-          code=$(curl -sSL -o /tmp/root.html -w '%{http_code}' --max-time 30 "${BASE_URL}/" || echo 000)
+          code=$(curl -sSL -o /tmp/root.html -w '%{http_code}' --max-time 30 "${BASE_URL}/" 2>/dev/null || true); code=${code:-000}
           if [ "$code" != "200" ]; then
             echo "- ✗ Forsiden svarte ikke som forventet." >> "$GITHUB_STEP_SUMMARY"
             echo "::error::Forsiden i testversjonen svarte ikke som forventet."

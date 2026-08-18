@@ -120,18 +120,32 @@ jobs:
         env:
           URL_IN: ${{ inputs.url }}
           DOMAIN: ${{ inputs.domain }}
+          MANIFEST: ${{ inputs.manifest_path }}
         run: |
           set -euo pipefail
+          # Precedence: explicit url > the Ingress host patched in the prod
+          # manifest (source of truth — apps can override the customer domain,
+          # e.g. bedriftsapp.apps.gb.logiskbrist.no) > <repo>.<domain>.
           if [ -n "$URL_IN" ]; then
             URL="${URL_IN%/}"
           else
-            if [ -z "$DOMAIN" ]; then
-              echo "::error::Enten «url» eller «domain» må settes."
-              exit 1
+            HOST=""
+            if [ -f "$MANIFEST" ]; then
+              HOST=$(yq -r '[.patches[] | select(.target.kind == "Ingress") | .patch | fromyaml | .[] | select(.path == "/spec/rules/0/host") | .value] | .[0] // ""' "$MANIFEST" 2>/dev/null || true)
+              [ "$HOST" = "null" ] && HOST=""
             fi
-            REPO_NAME=${GITHUB_REPOSITORY##*/}
-            REPO_NAME=$(printf '%s' "$REPO_NAME" | tr '[:upper:]' '[:lower:]')
-            URL="https://${REPO_NAME}.${DOMAIN%/}"
+            if [ -n "$HOST" ]; then
+              URL="https://${HOST}"
+              echo "Host taken from $MANIFEST"
+            else
+              if [ -z "$DOMAIN" ]; then
+                echo "::error::Enten «url» eller «domain» må settes."
+                exit 1
+              fi
+              REPO_NAME=${GITHUB_REPOSITORY##*/}
+              REPO_NAME=$(printf '%s' "$REPO_NAME" | tr '[:upper:]' '[:lower:]')
+              URL="https://${REPO_NAME}.${DOMAIN%/}"
+            fi
           fi
           printf 'url=%s\n' "$URL" >> "$GITHUB_OUTPUT"
           echo "Production base URL: $URL"
@@ -159,7 +173,7 @@ jobs:
           }
 
           while :; do
-            code=$(curl -sS -o /tmp/health.json -w '%{http_code}' --max-time 15 "$HEALTH_URL" || echo 000)
+            code=$(curl -sS -o /tmp/health.json -w '%{http_code}' --max-time 15 "$HEALTH_URL" 2>/dev/null || true); code=${code:-000}
             if [ "$code" = "200" ]; then
               [ -n "$saw_200_at" ] || saw_200_at=$(date +%s)
               body_tag=$(jq -r 'if type == "object" and has("tag") then (.tag // "") else "" end' /tmp/health.json 2>/dev/null || echo "")
@@ -176,7 +190,7 @@ jobs:
                 # ArgoCD sync + the rollout 90s after the first 200, then re-check.
                 now=$(date +%s)
                 if [ $(( now - saw_200_at )) -ge 90 ]; then
-                  recheck=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 15 "$HEALTH_URL" || echo 000)
+                  recheck=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 15 "$HEALTH_URL" 2>/dev/null || true); recheck=${recheck:-000}
                   if [ "$recheck" = "200" ]; then
                     echo "::warning::health endpoint does not report tag; verified reachability only"
                     break
@@ -197,7 +211,7 @@ jobs:
             sleep 10
           done
 
-          root_code=$(curl -sSL -o /tmp/root.html -w '%{http_code}' --max-time 30 "${BASE_URL}/" || echo 000)
+          root_code=$(curl -sSL -o /tmp/root.html -w '%{http_code}' --max-time 30 "${BASE_URL}/" 2>/dev/null || true); root_code=${root_code:-000}
           if [ "$root_code" != "200" ] || [ ! -s /tmp/root.html ]; then
             fail "forside" "GET ${BASE_URL}/ returned HTTP ${root_code} (body $( [ -s /tmp/root.html ] && echo non-empty || echo empty ))."
           fi
