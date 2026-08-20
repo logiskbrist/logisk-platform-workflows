@@ -128,7 +128,7 @@ gh workflow run set-secret.yaml \
   -f name=STRIPE_KEY \
   -f value='sk_live_...'
 
-# Preview override:
+# Preview-only value (does NOT propagate to prod; prod value above must also be set):
 gh workflow run set-secret.yaml \
   -f name=STRIPE_KEY \
   -f value='sk_test_...' \
