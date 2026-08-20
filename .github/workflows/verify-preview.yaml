@@ -103,6 +103,7 @@ jobs:
         id: manifest
         env:
           MANIFEST: ${{ inputs.manifest_path }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           set -euo pipefail
           TAG=""
@@ -113,10 +114,31 @@ jobs:
           if [ -z "$TAG" ] || [ "$TAG" = "PLACEHOLDER_TAG" ]; then
             echo "skip=true" >> "$GITHUB_OUTPUT"
             echo "No preview image yet (newTag='$TAG') — nothing to verify."
-          else
-            echo "skip=false" >> "$GITHUB_OUTPUT"
-            echo "Expecting preview to serve image tag: $TAG"
+            exit 0
           fi
+
+          # The tag in the checked-out manifest belongs to THIS commit only after
+          # bump-preview has pushed it. On the run triggered by the PR itself the
+          # manifest still carries whatever was inherited from the default branch,
+          # and waiting for that tag to appear on the preview never succeeds — the
+          # preview will serve this commit's image. Verifying is then the job of the
+          # run triggered by the bump commit, so skip instead of failing.
+          # build-and-push tags as main-<short-sha> on push and pr-<N>-<short-sha> on
+          # pull_request; accept either shape for this commit.
+          SHA="${HEAD_SHA:-$GITHUB_SHA}"
+          SHORT="${SHA:0:7}"
+          case "$TAG" in
+            *"-$SHORT")
+              echo "skip=false" >> "$GITHUB_OUTPUT"
+              echo "Expecting preview to serve image tag: $TAG"
+              ;;
+            *)
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+              echo "Manifest still points at '$TAG', which is not this commit ($SHORT) —"
+              echo "the preview image for this commit has not been bumped yet. Skipping;"
+              echo "the run triggered by the bump commit performs the verification."
+              ;;
+          esac
 
       - name: skip notice
         if: steps.manifest.outputs.skip == 'true'
@@ -125,7 +147,7 @@ jobs:
           {
             echo "### Testversjon"
             echo ""
-            echo "- ⏭️ Ingen testversjon er bygget ennå — hopper over kontrollen."
+            echo "- ⏭️ Testversjonen for denne endringen er ikke bygget ferdig ennå — kontrollen kjører når den er klar."
           } >> "$GITHUB_STEP_SUMMARY"
           echo "no preview image yet, skipping"
 
