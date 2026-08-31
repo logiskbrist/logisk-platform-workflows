@@ -1,8 +1,10 @@
 name: open-draft-pr
 # Opens a draft PR to main for any non-main branch push, so the ArgoCD
-# PullRequest generator has something to fire on. Uses a GitHub App token
-# (not GITHUB_TOKEN) so the resulting PR *does* trigger follow-on workflows
-# — validated 2026-07-04 spike.
+# PullRequest generator has something to fire on. Prefers a GitHub App token
+# (its PRs *do* trigger follow-on workflows — validated 2026-07-04 spike), and
+# falls back to GITHUB_TOKEN when the App isn't configured for this org so the
+# preview pipeline still moves even without App creds. Caller `permissions:`
+# for the calling job must include `pull-requests: write` for the fallback path.
 on:
   workflow_call:
     inputs:
@@ -10,12 +12,12 @@ on:
         required: false
         type: string
         default: LOGISK_GH_APP_ID
-        description: "Name of the org variable holding the GitHub App ID."
+        description: "Kept for backcompat; no longer read — App ID is now taken from secrets.LOGISK_GH_APP_ID directly."
       installation_id_var:
         required: false
         type: string
         default: LOGISK_GH_APP_INSTALLATION_ID
-        description: "Name of the org variable holding the installation ID."
+        description: "Kept for backcompat; no longer read."
       private_key_secret:
         required: false
         type: string
@@ -28,6 +30,7 @@ on:
 
 permissions:
   contents: read
+  pull-requests: write
 
 jobs:
   open:
@@ -35,8 +38,28 @@ jobs:
     outputs:
       pr_number: ${{ steps.pr.outputs.pr_number }}
     steps:
+      # Same resolve/mint/fallback pattern the other three token-using workflows
+      # use, so a caller whose org hasn't set the App creds still gets a draft
+      # PR (opened via GITHUB_TOKEN — such a PR won't fire pull_request-triggered
+      # workflows on creation, but the ArgoCD PullRequest generator polls the
+      # GitHub API and doesn't need them).
+      - name: resolve App token configuration
+        id: appcfg
+        env:
+          APP_ID: ${{ secrets.LOGISK_GH_APP_ID }}
+          HAS_PRIVATE_KEY: ${{ secrets[inputs.private_key_secret] != '' }}
+        run: |
+          set -euo pipefail
+          if [ -n "$APP_ID" ] && [ "$HAS_PRIVATE_KEY" = "true" ]; then
+            echo "use_app=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "use_app=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::GitHub App not configured for this org — falling back to GITHUB_TOKEN. The auto-opened draft PR will not fire pull_request-triggered workflows on creation."
+          fi
+
       - name: mint GitHub App token
         id: app_token
+        if: steps.appcfg.outputs.use_app == 'true'
         uses: actions/create-github-app-token@v1
         with:
           app-id: ${{ secrets.LOGISK_GH_APP_ID }}
@@ -48,7 +71,7 @@ jobs:
       - name: open draft PR if none exists
         id: pr
         env:
-          GH_TOKEN: ${{ steps.app_token.outputs.token }}
+          GH_TOKEN: ${{ steps.app_token.outputs.token || github.token }}
         run: |
           set -euo pipefail
           BRANCH=${GITHUB_REF##refs/heads/}
