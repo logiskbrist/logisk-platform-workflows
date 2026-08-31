@@ -39,7 +39,7 @@ jobs:
         id: app_token
         uses: actions/create-github-app-token@v1
         with:
-          app-id: ${{ vars[inputs.app_id_var] }}
+          app-id: ${{ secrets.LOGISK_GH_APP_ID }}
           private-key: ${{ secrets[inputs.private_key_secret] }}
           # Scope the token to the calling repo only.
           owner: ${{ github.repository_owner }}

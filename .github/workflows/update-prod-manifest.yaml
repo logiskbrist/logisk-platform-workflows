@@ -54,7 +54,7 @@ jobs:
       - name: resolve App token configuration
         id: appcfg
         env:
-          APP_ID: ${{ vars[inputs.app_id_var] }}
+          APP_ID: ${{ secrets.LOGISK_GH_APP_ID }}
           HAS_PRIVATE_KEY: ${{ secrets[inputs.private_key_secret] != '' }}
         run: |
           set -euo pipefail
@@ -70,7 +70,7 @@ jobs:
         if: steps.appcfg.outputs.use_app == 'true'
         uses: actions/create-github-app-token@v1
         with:
-          app-id: ${{ vars[inputs.app_id_var] }}
+          app-id: ${{ secrets.LOGISK_GH_APP_ID }}
           private-key: ${{ secrets[inputs.private_key_secret] }}
           # Scope the token to the calling repo only.
           owner: ${{ github.repository_owner }}
