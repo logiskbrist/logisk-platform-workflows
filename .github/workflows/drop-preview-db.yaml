@@ -11,6 +11,26 @@ name: drop-preview-db
 on:
   workflow_call:
     inputs:
+      # Azure/KV identity passed from the caller. Org VARIABLES do not cross
+      # the org boundary either, so cross-org callers must pass these via
+      # `with:` (e.g. azure_client_id: ${{ vars.LOGISK_AZURE_CLIENT_ID }});
+      # the *_var indirections below only resolve for same-org callers.
+      azure_client_id:
+        required: false
+        type: string
+        default: ''
+      azure_tenant_id:
+        required: false
+        type: string
+        default: ''
+      azure_subscription_id:
+        required: false
+        type: string
+        default: ''
+      keyvault_name:
+        required: false
+        type: string
+        default: ''
       pr_number:
         required: true
         type: string
@@ -41,13 +61,13 @@ jobs:
     steps:
       - uses: azure/login@v2
         with:
-          client-id: ${{ vars[inputs.azure_client_id_var] }}
-          tenant-id: ${{ vars[inputs.azure_tenant_id_var] }}
-          subscription-id: ${{ vars[inputs.azure_subscription_id_var] }}
+          client-id: ${{ inputs.azure_client_id || vars[inputs.azure_client_id_var] }}
+          tenant-id: ${{ inputs.azure_tenant_id || vars[inputs.azure_tenant_id_var] }}
+          subscription-id: ${{ inputs.azure_subscription_id || vars[inputs.azure_subscription_id_var] }}
 
       - name: drop preview database
         env:
-          KV: ${{ vars[inputs.keyvault_var] }}
+          KV: ${{ inputs.keyvault_name || vars[inputs.keyvault_var] }}
           PR: ${{ inputs.pr_number }}
         run: |
           set -euo pipefail

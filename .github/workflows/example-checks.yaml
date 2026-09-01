@@ -20,7 +20,10 @@ on:
 jobs:
   ai-review:
     uses: PLACEHOLDER_CUSTOMERORG/logisk-platform-workflows/.github/workflows/ai-review.yaml@v1
-    secrets: inherit
+    secrets:
+      LOGISK_GH_APP_ID: ${{ secrets.LOGISK_GH_APP_ID }}
+      LOGISK_GH_APP_PRIVATE_KEY: ${{ secrets.LOGISK_GH_APP_PRIVATE_KEY }}
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
 
   verify-preview:
     uses: PLACEHOLDER_CUSTOMERORG/logisk-platform-workflows/.github/workflows/verify-preview.yaml@v1

@@ -38,7 +38,9 @@ jobs:
   open-draft-pr:
     if: github.event_name == 'push' && github.ref != 'refs/heads/main'
     uses: PLACEHOLDER_CUSTOMERORG/logisk-platform-workflows/.github/workflows/open-draft-pr.yaml@v1
-    secrets: inherit
+    secrets:
+      LOGISK_GH_APP_ID: ${{ secrets.LOGISK_GH_APP_ID }}
+      LOGISK_GH_APP_PRIVATE_KEY: ${{ secrets.LOGISK_GH_APP_PRIVATE_KEY }}
 
   # bump-prod-* jobs are chained (needs:) so pushes to main happen one at a time.
   # The bumpers also retry with pull --rebase, but explicit serialization is cleaner.
@@ -46,7 +48,9 @@ jobs:
     needs: build-web
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     uses: PLACEHOLDER_CUSTOMERORG/logisk-platform-workflows/.github/workflows/update-prod-manifest.yaml@v1
-    secrets: inherit
+    secrets:
+      LOGISK_GH_APP_ID: ${{ secrets.LOGISK_GH_APP_ID }}
+      LOGISK_GH_APP_PRIVATE_KEY: ${{ secrets.LOGISK_GH_APP_PRIVATE_KEY }}
     with:
       image_tag: ${{ needs.build-web.outputs.tag }}
       image_name: ${{ needs.build-web.outputs.image }}
@@ -55,7 +59,9 @@ jobs:
     needs: [build-api, bump-prod-web]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     uses: PLACEHOLDER_CUSTOMERORG/logisk-platform-workflows/.github/workflows/update-prod-manifest.yaml@v1
-    secrets: inherit
+    secrets:
+      LOGISK_GH_APP_ID: ${{ secrets.LOGISK_GH_APP_ID }}
+      LOGISK_GH_APP_PRIVATE_KEY: ${{ secrets.LOGISK_GH_APP_PRIVATE_KEY }}
     with:
       image_tag: ${{ needs.build-api.outputs.tag }}
       image_name: ${{ needs.build-api.outputs.image }}
@@ -64,7 +70,9 @@ jobs:
     needs: build-web
     if: github.event_name == 'pull_request' && github.event.action != 'closed'
     uses: PLACEHOLDER_CUSTOMERORG/logisk-platform-workflows/.github/workflows/update-preview-manifest.yaml@v1
-    secrets: inherit
+    secrets:
+      LOGISK_GH_APP_ID: ${{ secrets.LOGISK_GH_APP_ID }}
+      LOGISK_GH_APP_PRIVATE_KEY: ${{ secrets.LOGISK_GH_APP_PRIVATE_KEY }}
     with:
       image_tag: ${{ needs.build-web.outputs.tag }}
       image_name: ${{ needs.build-web.outputs.image }}
@@ -73,7 +81,9 @@ jobs:
     needs: [build-api, bump-preview-web]
     if: github.event_name == 'pull_request' && github.event.action != 'closed'
     uses: PLACEHOLDER_CUSTOMERORG/logisk-platform-workflows/.github/workflows/update-preview-manifest.yaml@v1
-    secrets: inherit
+    secrets:
+      LOGISK_GH_APP_ID: ${{ secrets.LOGISK_GH_APP_ID }}
+      LOGISK_GH_APP_PRIVATE_KEY: ${{ secrets.LOGISK_GH_APP_PRIVATE_KEY }}
     with:
       image_tag: ${{ needs.build-api.outputs.tag }}
       image_name: ${{ needs.build-api.outputs.image }}

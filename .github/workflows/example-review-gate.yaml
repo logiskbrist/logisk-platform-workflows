@@ -26,4 +26,7 @@ jobs:
     # comment. Only do that if you can produce the *slugified* URL — the raw
     # branch name is not the hostname (see verify-preview's slug rules), so a
     # naive interpolation of github.head_ref yields a dead link.
-    secrets: inherit
+    secrets:
+      LOGISK_GH_APP_ID: ${{ secrets.LOGISK_GH_APP_ID }}
+      LOGISK_GH_APP_PRIVATE_KEY: ${{ secrets.LOGISK_GH_APP_PRIVATE_KEY }}
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
