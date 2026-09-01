@@ -77,3 +77,11 @@ jobs:
     with:
       image_tag: ${{ needs.build-api.outputs.tag }}
       image_name: ${{ needs.build-api.outputs.image }}
+
+  # After a publish lands on main, bring every open testversjon up to date with
+  # it so previews never go stale. Conflicts are never forced — the PR gets one
+  # sticky Norwegian comment instead. See example-caller.yaml.
+  sync-open-prs:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    uses: PLACEHOLDER_CUSTOMERORG/logisk-platform-workflows/.github/workflows/sync-open-prs.yaml@v1
+    secrets: inherit

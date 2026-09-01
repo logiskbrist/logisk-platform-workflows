@@ -1,0 +1,255 @@
+name: sync-open-prs
+# After a push to the default branch (i.e. a publish), merge the updated base
+# into every open PR branch so testversjoner never go stale. Each push lands
+# with the App token, so the branch rebuilds and its preview redeploys against
+# the fresh base — the server-side complement of the /publish skill's
+# sync-before-merge step.
+#
+# Squash-merged PRs carry their own manifests/preview bump into the base, so a
+# later sync into another branch conflicts on that file almost every time.
+# Conflicts confined to manifests/preview/** are resolved mechanically with the
+# branch's own version (the preview manifest belongs to the branch). Any other
+# conflict is never forced: the merge is aborted and the PR gets ONE sticky
+# comment in Norwegian saying the testversjon needs updating and that the
+# assistant will handle it next time the user works on it. The comment is
+# removed again once a later sync succeeds. Nothing here mentions branches or
+# merges in customer-facing text.
+on:
+  workflow_call:
+    inputs:
+      base_branch:
+        required: false
+        type: string
+        default: ''
+        description: "Branch to merge into the open PR branches. Defaults to the ref that triggered the caller."
+      private_key_secret:
+        required: false
+        type: string
+        default: LOGISK_GH_APP_PRIVATE_KEY
+        description: "Name of the org secret holding the App private key. Falls back to GITHUB_TOKEN if unset (pushes then trigger no rebuild)."
+    outputs:
+      synced:
+        description: "Number of PR branches that received a sync commit."
+        value: ${{ jobs.sync-open-prs.outputs.synced }}
+      conflicted:
+        description: "Number of PR branches left alone because of a conflict (sticky comment posted)."
+        value: ${{ jobs.sync-open-prs.outputs.conflicted }}
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  sync-open-prs:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # Two quick merges to the base must not sync the same branches at once;
+    # the queued run picks up the newer base anyway.
+    concurrency:
+      group: sync-open-prs-${{ github.repository }}
+      cancel-in-progress: false
+    outputs:
+      synced: ${{ steps.sync.outputs.synced }}
+      conflicted: ${{ steps.sync.outputs.conflicted }}
+    steps:
+      # The sync commit is pushed with the GitHub App token, not GITHUB_TOKEN:
+      # an App-token push fires the branch's build (fresh preview image) and
+      # `pull_request: synchronize` (checks re-run against the synced code).
+      # A GITHUB_TOKEN push would sync the code but trigger nothing.
+      - name: resolve App token configuration
+        id: appcfg
+        env:
+          APP_ID: ${{ secrets.LOGISK_GH_APP_ID }}
+          HAS_PRIVATE_KEY: ${{ secrets[inputs.private_key_secret] != '' }}
+        run: |
+          set -euo pipefail
+          if [ -n "$APP_ID" ] && [ "$HAS_PRIVATE_KEY" = "true" ]; then
+            echo "use_app=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "use_app=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::GitHub App not configured for this org — falling back to GITHUB_TOKEN. Synced branches will not rebuild until their next push."
+          fi
+
+      - name: mint GitHub App token
+        id: app_token
+        if: steps.appcfg.outputs.use_app == 'true'
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.LOGISK_GH_APP_ID }}
+          private-key: ${{ secrets[inputs.private_key_secret] }}
+          # Scope the token to the calling repo only.
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+
+      - uses: actions/checkout@v4
+        with:
+          # Merging needs real history, not a shallow tip.
+          fetch-depth: 0
+          # Credentials are persisted by checkout, so the pushes below use this token.
+          token: ${{ steps.app_token.outputs.token || github.token }}
+
+      - name: merge the base into every open PR branch
+        id: sync
+        env:
+          GH_TOKEN: ${{ steps.app_token.outputs.token || github.token }}
+          BASE: ${{ inputs.base_branch || github.ref_name }}
+          MARKER: "<!-- logisk-sync-main -->"
+          # Customer-facing (commit shows up in the PR timeline): plain
+          # Norwegian, no branch/merge vocabulary.
+          MERGE_MSG: "Oppdatert med siste publiserte versjon"
+        run: |
+          set -euo pipefail
+
+          git config user.email "platform-bot@logiskbrist.no"
+          git config user.name "platform-bot"
+
+          # The sticky conflict comment, upserted per PR and deleted again the
+          # moment a sync goes through. One comment, refreshed — never a stream.
+          cat > /tmp/comment.md <<EOF
+          ### Testversjonen må oppdateres
+
+          Det er publisert endringer i appen som denne testversjonen ikke har fått med seg, og de kunne ikke hentes inn automatisk. Du trenger ikke gjøre noe: assistenten oppdaterer testversjonen neste gang du jobber videre på den.
+
+          $MARKER
+          EOF
+          jq -n --rawfile body /tmp/comment.md '{body: $body}' > /tmp/comment.json
+
+          sticky_id() { # <pr> → comment id of our marker comment, or empty
+            gh api "repos/$GITHUB_REPOSITORY/issues/$1/comments" --paginate --jq '.[]' \
+              | jq -rs --arg m "$MARKER" '[.[] | select(.body != null and (.body | contains($m)))] | (last // empty) | .id'
+          }
+
+          upsert_sticky() { # <pr>
+            local id; id=$(sticky_id "$1")
+            if [ -n "$id" ]; then
+              gh api --method PATCH "repos/$GITHUB_REPOSITORY/issues/comments/$id" --input /tmp/comment.json >/dev/null
+              echo "  refreshed sticky comment $id on #$1"
+            else
+              gh api --method POST "repos/$GITHUB_REPOSITORY/issues/$1/comments" --input /tmp/comment.json >/dev/null
+              echo "  posted sticky comment on #$1"
+            fi
+          }
+
+          drop_sticky() { # <pr> — the branch is in sync again; the message is stale
+            local id; id=$(sticky_id "$1")
+            if [ -n "$id" ]; then
+              gh api --method DELETE "repos/$GITHUB_REPOSITORY/issues/comments/$id" >/dev/null
+              echo "  removed stale sticky comment $id from #$1"
+            fi
+          }
+
+          # try_merge <branch> → 0 merged (or already up to date), 1 conflict.
+          # Assumes origin/$BASE and origin/<branch> are freshly fetched.
+          try_merge() {
+            local branch="$1"
+            git switch --force-create "$branch" "origin/$branch" >/dev/null 2>&1
+            if git merge --no-ff -m "$MERGE_MSG" "origin/$BASE" >/dev/null 2>&1; then
+              return 0
+            fi
+            # A squash-merged PR brings its preview-manifest bump into the base,
+            # so this conflict is routine. The preview manifest belongs to the
+            # branch — keep the branch's side and complete the merge.
+            local conflicts
+            conflicts=$(git diff --name-only --diff-filter=U)
+            if [ -n "$conflicts" ] && ! echo "$conflicts" | grep -qv '^manifests/preview/'; then
+              if git checkout --ours -- manifests/preview/ 2>/dev/null \
+                 && git add -- manifests/preview/ \
+                 && [ -z "$(git diff --name-only --diff-filter=U)" ] \
+                 && git -c core.editor=true merge --continue >/dev/null 2>&1; then
+                echo "  resolved preview-manifest conflict with the branch's own version"
+                return 0
+              fi
+              git merge --abort 2>/dev/null || true
+              return 1
+            fi
+            git merge --abort 2>/dev/null || true
+            return 1
+          }
+
+          SYNCED=0
+          CONFLICTED=0
+          FAILED=0
+          : > /tmp/summary.md
+
+          gh pr list --repo "$GITHUB_REPOSITORY" --state open \
+            --json number,title,headRefName,isCrossRepository \
+            --jq '.[]' | jq -c '.' > /tmp/prs.jsonl || true
+
+          while IFS= read -r PR; do
+            NUM=$(echo "$PR" | jq -r '.number')
+            TITLE=$(echo "$PR" | jq -r '.title')
+            BRANCH=$(echo "$PR" | jq -r '.headRefName')
+            CROSS=$(echo "$PR" | jq -r '.isCrossRepository')
+
+            if [ "$CROSS" = "true" ] || [ "$BRANCH" = "$BASE" ]; then
+              echo "#$NUM ($BRANCH): skipped"
+              continue
+            fi
+            echo "#$NUM ($BRANCH):"
+
+            # Retry the whole fetch→merge→push cycle: a push can race with the
+            # branch's own preview bump, and a rejected push means our merge is
+            # already stale — redo it on the fresh tip.
+            DONE=false
+            for attempt in 1 2 3; do
+              if ! git fetch --quiet origin "$BASE" "$BRANCH"; then
+                # Branch already gone (PR closed under us) — nothing to sync.
+                echo "  could not fetch $BRANCH — skipped"
+                DONE=true
+                break
+              fi
+
+              if git merge-base --is-ancestor "origin/$BASE" "origin/$BRANCH"; then
+                echo "  already up to date"
+                drop_sticky "$NUM" || true
+                DONE=true
+                break
+              fi
+
+              if ! try_merge "$BRANCH"; then
+                echo "  conflict — leaving the branch alone"
+                upsert_sticky "$NUM" || true
+                printf -- '- *%s*: må oppdateres sammen med assistenten (beskjed lagt inn)\n' "$TITLE" >> /tmp/summary.md
+                CONFLICTED=$((CONFLICTED + 1))
+                DONE=true
+                break
+              fi
+
+              if git push origin "HEAD:refs/heads/$BRANCH" 2>/dev/null; then
+                echo "  synced"
+                drop_sticky "$NUM" || true
+                printf -- '- *%s*: oppdatert\n' "$TITLE" >> /tmp/summary.md
+                SYNCED=$((SYNCED + 1))
+                DONE=true
+                break
+              fi
+              echo "  push rejected (attempt $attempt/3), refetching and remerging..."
+            done
+
+            if [ "$DONE" != "true" ]; then
+              echo "::warning::could not sync #$NUM ($BRANCH) after 3 attempts"
+              printf -- '- *%s*: kunne ikke oppdateres nå (prøves igjen ved neste publisering)\n' "$TITLE" >> /tmp/summary.md
+              FAILED=$((FAILED + 1))
+            fi
+          done < /tmp/prs.jsonl
+
+          {
+            printf 'synced=%s\n' "$SYNCED"
+            printf 'conflicted=%s\n' "$CONFLICTED"
+          } >> "$GITHUB_OUTPUT"
+
+          {
+            echo "### Oppdatering av testversjoner"
+            echo ""
+            if [ -s /tmp/summary.md ]; then
+              cat /tmp/summary.md
+            else
+              echo "Ingen testversjoner å oppdatere."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          echo
+          echo "sync complete: synced=$SYNCED conflicted=$CONFLICTED failed=$FAILED"
+          # Conflicts are an expected outcome, not an error. Only unexpected
+          # push failures turn the run red.
+          [ "$FAILED" -eq 0 ]
