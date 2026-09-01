@@ -29,6 +29,15 @@ on:
         type: string
         default: LOGISK_GH_APP_PRIVATE_KEY
         description: "Name of the org secret holding the App private key."
+    # Declared explicitly — `secrets: inherit` only crosses repo boundaries
+    # within the same org/enterprise; customer apps call this cross-org and
+    # must map these (see example-caller.yaml). Optional: absent, the workflow
+    # takes its GITHUB_TOKEN fallback.
+    secrets:
+      LOGISK_GH_APP_ID:
+        required: false
+      LOGISK_GH_APP_PRIVATE_KEY:
+        required: false
     outputs:
       previous_tag:
         description: "The newTag value in the manifest BEFORE this bump. Empty if the manifest had none. Feed this to verify-prod as previous_tag so a failed rollout can be rolled back."

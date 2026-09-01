@@ -58,6 +58,26 @@ Generate a private key and note the App ID + Installation ID. The App is local t
 
 All reusable workflow inputs default to these names, so a caller usually needs no `with:` overrides for auth.
 
+**Cross-org callers (the normal case since the canonical repo moved to `logiskbrist`): neither `secrets: inherit` nor org `vars` cross the org boundary.** Callers must pass the values explicitly — App/API secrets via a `secrets:` map, Azure/KV identity via `with:` (the `${{ vars.* }}` / `${{ secrets.* }}` expressions evaluate on the caller's side, where the org config is visible):
+
+```yaml
+    uses: logiskbrist/logisk-platform-workflows/.github/workflows/update-prod-manifest.yaml@v3
+    secrets:
+      LOGISK_GH_APP_ID: ${{ secrets.LOGISK_GH_APP_ID }}
+      LOGISK_GH_APP_PRIVATE_KEY: ${{ secrets.LOGISK_GH_APP_PRIVATE_KEY }}
+```
+
+```yaml
+    uses: logiskbrist/logisk-platform-workflows/.github/workflows/set-secret.yaml@v3
+    with:
+      azure_client_id: ${{ vars.LOGISK_AZURE_CLIENT_ID }}
+      azure_tenant_id: ${{ vars.LOGISK_AZURE_TENANT_ID }}
+      azure_subscription_id: ${{ vars.LOGISK_AZURE_SUBSCRIPTION_ID }}
+      keyvault_name: ${{ vars.LOGISK_KEYVAULT_NAME }}
+```
+
+(`ai-review` / `lb-review-gate` additionally take `ANTHROPIC_API_KEY` in the secrets map.) The App ID + installation ID must also exist as org **secrets** (they do on current customer orgs), since org variables never reach the reusable workflows. See the `example-*.yaml` files — they show the full pattern.
+
 ## How a customer app repo consumes these
 
 Copy [`example-caller.yaml`](.github/workflows/example-caller.yaml) into the app repo at `.github/workflows/build.yaml`. It composes the reusable workflows into the standard flow:

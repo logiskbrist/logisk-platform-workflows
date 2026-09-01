@@ -69,6 +69,17 @@ on:
         required: false
         type: string
         default: LOGISK_GH_APP_PRIVATE_KEY
+    # Declared explicitly — `secrets: inherit` only crosses repo boundaries
+    # within the same org/enterprise; customer apps call this cross-org and
+    # must map these (see example-caller.yaml). Optional: absent, the workflow
+    # takes its GITHUB_TOKEN fallback.
+    secrets:
+      LOGISK_GH_APP_ID:
+        required: false
+      LOGISK_GH_APP_PRIVATE_KEY:
+        required: false
+      ANTHROPIC_API_KEY:
+        required: false
     outputs:
       critical:
         description: "true when the repo is marked as a critical app."
@@ -105,7 +116,7 @@ jobs:
       - name: resolve App token configuration
         id: appcfg
         env:
-          APP_ID: ${{ vars[inputs.app_id_var] }}
+          APP_ID: ${{ secrets.LOGISK_GH_APP_ID }}
           HAS_PRIVATE_KEY: ${{ secrets[inputs.private_key_secret] != '' }}
           HAS_API_KEY: ${{ secrets[inputs.api_key_secret] != '' }}
         run: |
@@ -122,7 +133,7 @@ jobs:
         if: steps.appcfg.outputs.use_app == 'true'
         uses: actions/create-github-app-token@v1
         with:
-          app-id: ${{ vars[inputs.app_id_var] }}
+          app-id: ${{ secrets.LOGISK_GH_APP_ID }}
           private-key: ${{ secrets[inputs.private_key_secret] }}
           owner: ${{ github.repository_owner }}
           repositories: ${{ github.event.repository.name }}

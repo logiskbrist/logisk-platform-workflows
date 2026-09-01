@@ -30,7 +30,9 @@ jobs:
     # Only fires on non-main branch pushes. Idempotent — no-op if PR exists.
     if: github.event_name == 'push' && github.ref != 'refs/heads/main'
     uses: PLACEHOLDER_CUSTOMERORG/logisk-platform-workflows/.github/workflows/open-draft-pr.yaml@v1
-    secrets: inherit
+    secrets:
+      LOGISK_GH_APP_ID: ${{ secrets.LOGISK_GH_APP_ID }}
+      LOGISK_GH_APP_PRIVATE_KEY: ${{ secrets.LOGISK_GH_APP_PRIVATE_KEY }}
 
   bump-prod:
     needs: build
@@ -38,7 +40,9 @@ jobs:
     uses: PLACEHOLDER_CUSTOMERORG/logisk-platform-workflows/.github/workflows/update-prod-manifest.yaml@v1
     with:
       image_tag: ${{ needs.build.outputs.tag }}
-    secrets: inherit
+    secrets:
+      LOGISK_GH_APP_ID: ${{ secrets.LOGISK_GH_APP_ID }}
+      LOGISK_GH_APP_PRIVATE_KEY: ${{ secrets.LOGISK_GH_APP_PRIVATE_KEY }}
 
   # Waits for prod to actually serve the tag we just deployed. If it doesn't,
   # the prod manifest is pinned back to `previous_tag` and an issue is opened.
@@ -50,7 +54,9 @@ jobs:
       domain: PLACEHOLDER_CUSTOMER_DOMAIN
       expect_tag: ${{ needs.build.outputs.tag }}
       previous_tag: ${{ needs.bump-prod.outputs.previous_tag }}
-    secrets: inherit
+    secrets:
+      LOGISK_GH_APP_ID: ${{ secrets.LOGISK_GH_APP_ID }}
+      LOGISK_GH_APP_PRIVATE_KEY: ${{ secrets.LOGISK_GH_APP_PRIVATE_KEY }}
 
   bump-preview:
     needs: build
@@ -58,7 +64,9 @@ jobs:
     uses: PLACEHOLDER_CUSTOMERORG/logisk-platform-workflows/.github/workflows/update-preview-manifest.yaml@v1
     with:
       image_tag: ${{ needs.build.outputs.tag }}
-    secrets: inherit
+    secrets:
+      LOGISK_GH_APP_ID: ${{ secrets.LOGISK_GH_APP_ID }}
+      LOGISK_GH_APP_PRIVATE_KEY: ${{ secrets.LOGISK_GH_APP_PRIVATE_KEY }}
 
   # After a publish lands on main, bring every open testversjon up to date with
   # it so previews never go stale. Independent of build on purpose: main moved
