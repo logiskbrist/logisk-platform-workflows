@@ -27,6 +27,11 @@ on:
         type: string
         default: LOGISK_GH_APP_PRIVATE_KEY
         description: "Name of the org secret holding the App private key. Falls back to GITHUB_TOKEN if unset (pushes then trigger no rebuild)."
+      skip_label:
+        required: false
+        type: string
+        default: hold-oppdatering
+        description: "PRs carrying this label are left alone entirely — no merge, no comment. The escape hatch for a long-running testversjon or one mid-demo; the assistant sets and removes the label on the user's behalf."
     outputs:
       synced:
         description: "Number of PR branches that received a sync commit."
@@ -93,6 +98,7 @@ jobs:
         env:
           GH_TOKEN: ${{ steps.app_token.outputs.token || github.token }}
           BASE: ${{ inputs.base_branch || github.ref_name }}
+          SKIP_LABEL: ${{ inputs.skip_label }}
           MARKER: "<!-- logisk-sync-main -->"
           # Customer-facing (commit shows up in the PR timeline): plain
           # Norwegian, no branch/merge vocabulary.
@@ -172,7 +178,7 @@ jobs:
           : > /tmp/summary.md
 
           gh pr list --repo "$GITHUB_REPOSITORY" --state open \
-            --json number,title,headRefName,isCrossRepository \
+            --json number,title,headRefName,isCrossRepository,labels \
             --jq '.[]' | jq -c '.' > /tmp/prs.jsonl || true
 
           while IFS= read -r PR; do
@@ -180,9 +186,15 @@ jobs:
             TITLE=$(echo "$PR" | jq -r '.title')
             BRANCH=$(echo "$PR" | jq -r '.headRefName')
             CROSS=$(echo "$PR" | jq -r '.isCrossRepository')
+            HELD=$(echo "$PR" | jq -r --arg l "$SKIP_LABEL" 'any(.labels[]?.name; . == $l)')
 
             if [ "$CROSS" = "true" ] || [ "$BRANCH" = "$BASE" ]; then
               echo "#$NUM ($BRANCH): skipped"
+              continue
+            fi
+            if [ "$HELD" = "true" ]; then
+              echo "#$NUM ($BRANCH): skipped — carries the '$SKIP_LABEL' label"
+              printf -- '- *%s*: satt på vent\n' "$TITLE" >> /tmp/summary.md
               continue
             fi
             echo "#$NUM ($BRANCH):"
