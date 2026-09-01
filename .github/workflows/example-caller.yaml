@@ -59,3 +59,13 @@ jobs:
     with:
       image_tag: ${{ needs.build.outputs.tag }}
     secrets: inherit
+
+  # After a publish lands on main, bring every open testversjon up to date with
+  # it so previews never go stale. Independent of build on purpose: main moved
+  # either way, so the sync runs even when the main build fails. Conflicts are
+  # never forced — the PR gets one sticky Norwegian comment and the assistant
+  # resolves it next time the user works on that testversjon.
+  sync-open-prs:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    uses: PLACEHOLDER_CUSTOMERORG/logisk-platform-workflows/.github/workflows/sync-open-prs.yaml@v1
+    secrets: inherit
