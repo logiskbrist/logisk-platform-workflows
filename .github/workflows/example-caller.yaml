@@ -65,7 +65,13 @@ jobs:
   # either way, so the sync runs even when the main build fails. Conflicts are
   # never forced — the PR gets one sticky Norwegian comment and the assistant
   # resolves it next time the user works on that testversjon.
+  #
+  # Secrets are mapped explicitly, not inherited: `secrets: inherit` only
+  # crosses repo boundaries within the same org/enterprise, and the canonical
+  # workflows live in the logiskbrist org — inherited org secrets arrive empty.
   sync-open-prs:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     uses: PLACEHOLDER_CUSTOMERORG/logisk-platform-workflows/.github/workflows/sync-open-prs.yaml@v1
-    secrets: inherit
+    secrets:
+      LOGISK_GH_APP_ID: ${{ secrets.LOGISK_GH_APP_ID }}
+      LOGISK_GH_APP_PRIVATE_KEY: ${{ secrets.LOGISK_GH_APP_PRIVATE_KEY }}
