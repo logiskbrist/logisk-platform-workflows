@@ -20,7 +20,6 @@ Reusable GitHub Actions workflows for customer apps deployed on Logiskbrist's AK
 | `.github/workflows/set-secret.yaml` | Write a secret to the customer's Key Vault under the naming convention `<app>-{prod,preview}-<KEY-with-hyphens>`. Uses OIDC to Azure; value is masked in logs. |
 | `.github/workflows/delete-secret.yaml` | Mirror of `set-secret` — `az keyvault secret delete`. |
 | `.github/workflows/list-secrets.yaml` | Lists env-var names scoped to the calling app. Values never printed. Output goes to both the run's Markdown summary and stdout with `PROD_SECRETS_{START,END}` markers for AI parsing. |
-| `.github/workflows/stale-preview-reaper.yaml` | Nightly cron in *this* repo (not called by app repos). Scans customer orgs for `logisk-platform`-tagged repos, closes PRs whose HEAD commit is older than 7 days. Triggers ArgoCD teardown indirectly. |
 | `.github/workflows/example-caller.yaml` | Not reusable — copy this file into a customer app repo at `.github/workflows/build.yaml`. |
 | `.github/workflows/example-checks.yaml` | Not reusable — copy into a customer app repo at `.github/workflows/checks.yaml`. The PR checks (`ai-review`, `verify-preview`). |
 | `.github/workflows/example-review-gate.yaml` | Not reusable — copy into a customer app repo at `.github/workflows/review-gate.yaml`. The critical-app gate, on `pull_request` + `pull_request_review`. |
@@ -84,7 +83,7 @@ Copy [`example-caller.yaml`](.github/workflows/example-caller.yaml) into the app
 
 - Push to main → `build-and-push` → `update-prod-manifest` → ArgoCD SCM Provider generator sees the bump → syncs `manifests/prod/`.
 - Push to any non-main branch → `open-draft-pr` opens a draft PR.
-- PR created → `build-and-push` → `update-preview-manifest` → ArgoCD PullRequest generator sees the PR (and the bumped manifest) → syncs `manifests/preview/`.
+- PR created → `build-and-push` → `update-preview-manifest`. The image is built and the preview manifest is bumped for every PR, but a preview Application only appears once the PR carries the `preview` label — the ArgoCD PullRequest generator filters on `github.labels: [preview]`. Add the label with `gh pr edit --add-label preview` to opt in; remove it (or close the PR) to tear the preview down. The nightly `preview-label-reaper` CronJob in each customer's cluster (`argocd` namespace) strips the label from PRs whose `updated_at` hasn't moved in 7 days.
 
 Alongside `build.yaml`, copy [`example-checks.yaml`](.github/workflows/example-checks.yaml) to `.github/workflows/checks.yaml` and [`example-review-gate.yaml`](.github/workflows/example-review-gate.yaml) to `.github/workflows/review-gate.yaml`. They are separate files because they need different triggers — see the next section.
 
