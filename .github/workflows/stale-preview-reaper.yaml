@@ -1,11 +1,14 @@
 name: stale-preview-reaper
-# Nightly cron in THIS repo (not called from customer app repos). Lists open
-# PRs across all customer org repos tagged `logisk-platform`, closes any PR
-# whose HEAD commit is older than the idle threshold. Closing the PR triggers
-# ArgoCD to prune the preview and teardown-preview-db to drop the DB.
+# Nightly cron in THIS repo. For each customer org, mint a scoped GitHub App
+# token and close PRs whose HEAD commit is older than IDLE_DAYS days. Closing
+# the PR triggers ArgoCD to prune the preview and each app repo's
+# `preview-cleanup.yaml` to drop the preview DB.
 #
-# NOT a reusable workflow — meant to run on this repo's schedule directly.
-# One entry per customer org.
+# One matrix entry per customer org. The Logisk GitHub App must be installed
+# on each with these permissions: contents:read, metadata:read,
+# pull_requests:write. App tokens are scoped per-installation, so we mint one
+# token per org — a token minted for the workflow's own org can't act on any
+# other.
 on:
   schedule:
     - cron: '30 3 * * *'   # 03:30 UTC daily
@@ -21,28 +24,30 @@ permissions:
 
 env:
   IDLE_DAYS: 7
-  # Add one entry per customer org. Each must have logisk-platform-workflows
-  # installed as a GitHub App with `pull_requests: write`.
-  CUSTOMER_ORGS: |
-    logiskbrist
-    # acmeco
-    # customer2
 
 jobs:
   reap:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        org:
+          - godtbrod
+          - GetFocused
+    name: reap (${{ matrix.org }})
     steps:
-      - name: mint GitHub App token
+      - name: mint GitHub App token for ${{ matrix.org }}
         id: app_token
         uses: actions/create-github-app-token@v1
         with:
           app-id: ${{ vars.LOGISK_GH_APP_ID }}
           private-key: ${{ secrets.LOGISK_GH_APP_PRIVATE_KEY }}
-          owner: ${{ github.repository_owner }}   # scope to installer; expand per-org as needed
+          owner: ${{ matrix.org }}
 
-      - name: reap stale previews
+      - name: reap stale previews in ${{ matrix.org }}
         env:
           GH_TOKEN: ${{ steps.app_token.outputs.token }}
+          ORG: ${{ matrix.org }}
           IDLE_DAYS: ${{ env.IDLE_DAYS }}
           DRY: ${{ inputs.dry_run }}
         shell: bash
@@ -53,28 +58,23 @@ jobs:
           CLOSED=0
           SKIPPED=0
 
-          for ORG in $(echo "${{ env.CUSTOMER_ORGS }}" | sed 's/#.*//' | awk 'NF'); do
-            echo "=== org: $ORG ==="
+          echo "=== org: $ORG (idle >= ${IDLE_DAYS}d) ==="
 
-            # Repos with the topic
-            REPOS=$(gh api "search/repositories?q=org:${ORG}+topic:logisk-platform" \
-              --jq '.items[].name')
+          # Repos in this org carrying the `logisk-platform` topic.
+          REPOS=$(gh api "search/repositories?q=org:${ORG}+topic:logisk-platform&per_page=100" \
+            --jq '.items[].name')
 
-            for REPO in $REPOS; do
-              # Open PRs in this repo
-              PRS=$(gh pr list --repo "$ORG/$REPO" --state open \
-                --json number,headRefName,updatedAt \
-                --jq '.[]')
-
-              echo "$PRS" | jq -c '.' | while read -r PR; do
+          for REPO in $REPOS; do
+            gh pr list --repo "$ORG/$REPO" --state open \
+              --json number,headRefName --jq '.[]' \
+            | while read -r PR; do
                 NUM=$(echo "$PR" | jq -r '.number')
                 BRANCH=$(echo "$PR" | jq -r '.headRefName')
 
-                # Head commit time via GH API (more accurate than PR updatedAt).
-                COMMIT_TIME=$(gh api "repos/$ORG/$REPO/pulls/$NUM" \
-                  --jq '.head.sha' \
-                  | xargs -I{} gh api "repos/$ORG/$REPO/commits/{}" \
-                  --jq '.commit.committer.date')
+                # HEAD commit committer time — a `git push` is what should
+                # reset the clock, not comments or metadata edits.
+                SHA=$(gh api "repos/$ORG/$REPO/pulls/$NUM" --jq '.head.sha')
+                COMMIT_TIME=$(gh api "repos/$ORG/$REPO/commits/$SHA" --jq '.commit.committer.date')
 
                 COMMIT_TS=$(date -u -d "$COMMIT_TIME" +%s 2>/dev/null || \
                             date -u -j -f '%Y-%m-%dT%H:%M:%SZ' "$COMMIT_TIME" +%s)
@@ -92,8 +92,7 @@ jobs:
                   fi
                 fi
               done
-            done
           done
 
           echo
-          echo "Reap complete: closed=$CLOSED, dry-run-skipped=$SKIPPED"
+          echo "Reap complete for $ORG: closed=$CLOSED, dry-run-skipped=$SKIPPED"
