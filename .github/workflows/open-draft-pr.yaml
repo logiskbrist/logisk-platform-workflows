@@ -86,12 +86,26 @@ jobs:
           BRANCH=${GITHUB_REF##refs/heads/}
           EXISTING=$(gh pr list --repo "$GITHUB_REPOSITORY" --head "$BRANCH" --json number --jq '.[0].number // ""')
           if [ -z "$EXISTING" ]; then
+            # `--label preview` is required for the ArgoCD PullRequest
+            # generator's filter (see gb-preview-appset / customer-<c>-preview-
+            # appset — spec.generators.pullRequest.github.labels). Without it,
+            # the PR opens but no preview Ingress is generated; the branch
+            # host 404s because no rule matches it. Every auto-opened preview
+            # PR needs it.
             gh pr create --repo "$GITHUB_REPOSITORY" \
               --head "$BRANCH" --base main \
               --draft --title "[preview] $BRANCH" \
+              --label preview \
               --body "Auto-opened by logisk-platform-workflows for the preview environment."
             EXISTING=$(gh pr list --repo "$GITHUB_REPOSITORY" --head "$BRANCH" --json number --jq '.[0].number // ""')
           else
+            # PR already exists — ensure the `preview` label is on it so the
+            # AppSet picks it up. Idempotent: `gh pr edit --add-label` is a
+            # no-op when the label is already present. Handles PRs opened
+            # manually (or by older versions of this workflow) that don't
+            # carry the label yet.
             echo "PR already exists for $BRANCH (#$EXISTING)"
+            gh pr edit "$EXISTING" --repo "$GITHUB_REPOSITORY" --add-label preview 2>&1 || \
+              echo "::warning::could not add preview label to #$EXISTING (label may not exist yet in this repo)"
           fi
           printf 'pr_number=%s\n' "$EXISTING" >> "$GITHUB_OUTPUT"
