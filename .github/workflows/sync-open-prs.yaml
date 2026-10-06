@@ -38,7 +38,7 @@ on:
       debounce_minutes:
         required: false
         type: number
-        default: 15
+        default: 20
         description: "Wait this long before syncing, and stand down if a newer publish lands on the base meanwhile (its own run syncs instead). 0 syncs immediately, as before. Capped at 60."
     # Declared explicitly, NOT read via `secrets: inherit`: inherit only works
     # when caller and called workflow are in the same org or enterprise, and
