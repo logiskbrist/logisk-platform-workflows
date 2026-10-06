@@ -14,6 +14,14 @@ name: sync-open-prs
 # assistant will handle it next time the user works on it. The comment is
 # removed again once a later sync succeeds. Nothing here mentions branches or
 # merges in customer-facing text.
+#
+# Debounced: every sync push rebuilds the branch and re-runs its PR checks, so
+# the cost is publishes × open PRs. Publishes come in bursts (often 10–20 min
+# apart during a working session), so the `debounce` job waits
+# `debounce_minutes` first and stands down if a newer publish lands on the base
+# in the meantime — that publish's own run does the sync instead. A burst of
+# publishes costs one sync round, not one per publish. On godtbrod/deigverkstedet
+# sync commits were 77% of all builds before this (Sept 2026).
 on:
   workflow_call:
     inputs:
@@ -27,6 +35,11 @@ on:
         type: string
         default: hold-oppdatering
         description: "PRs carrying this label are left alone entirely — no merge, no comment. The escape hatch for a long-running testversjon or one mid-demo; the assistant sets and removes the label on the user's behalf."
+      debounce_minutes:
+        required: false
+        type: number
+        default: 20
+        description: "Wait this long before syncing, and stand down if a newer publish lands on the base meanwhile (its own run syncs instead). 0 syncs immediately, as before. Capped at 60."
     # Declared explicitly, NOT read via `secrets: inherit`: inherit only works
     # when caller and called workflow are in the same org or enterprise, and
     # customer app repos call this cross-org. Callers must map these:
@@ -40,6 +53,7 @@ on:
         required: false
       LOGISK_GH_APP_PRIVATE_KEY:
         required: false
+    # Both outputs are empty when the run stood down for a newer publish.
     outputs:
       synced:
         description: "Number of PR branches that received a sync commit."
@@ -53,7 +67,69 @@ permissions:
   pull-requests: write
 
 jobs:
+  # Trailing-edge debounce. Deliberately NOT a `concurrency` group with
+  # cancel-in-progress: a cancelled job marks the caller's whole publish run as
+  # cancelled. Standing down instead leaves sync-open-prs skipped and the run
+  # green. Polls once a minute so a superseded run stops billing as soon as the
+  # newer publish is visible, not after the full wait.
+  #
+  # "Newer publish" = any commit on the base since ours that touches a path
+  # outside manifests/** and *.md — i.e. one that gets past the callers'
+  # `paths-ignore` and so runs its own sync. The prod-manifest bump that every
+  # publish pushes to the base a few minutes in is manifests-only, so it never
+  # counts. Any doubt (API error, custom base_branch) fails open: sync now.
+  debounce:
+    runs-on: ubuntu-latest
+    # Expressions can't add, so this is fixed; the script caps the wait at 60.
+    timeout-minutes: 65
+    outputs:
+      superseded: ${{ steps.wait.outputs.superseded }}
+    steps:
+      - name: wait for the publish burst to settle
+        id: wait
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MINUTES: ${{ inputs.debounce_minutes }}
+          BASE: ${{ inputs.base_branch || github.ref_name }}
+          OURS: ${{ github.sha }}
+        run: |
+          set -uo pipefail
+          echo "superseded=false" >> "$GITHUB_OUTPUT"
+          if [ "$MINUTES" -le 0 ]; then
+            echo "debounce disabled — syncing now"
+            exit 0
+          fi
+          [ "$MINUTES" -gt 60 ] && MINUTES=60
+          if [ "$BASE" != "$GITHUB_REF_NAME" ]; then
+            echo "base '$BASE' is not the triggering ref — no publish to compare against, syncing now"
+            exit 0
+          fi
+
+          # Prints the paths of newer base commits that would trigger a build.
+          newer_publish() {
+            gh api "repos/$GITHUB_REPOSITORY/compare/$OURS...$BASE" --jq '.files[].filename' \
+              | grep -Ev '^manifests/|\.md$'
+          }
+
+          for i in $(seq 1 "$MINUTES"); do
+            sleep 60
+            if paths=$(newer_publish) && [ -n "$paths" ]; then
+              echo "a newer publish landed on $BASE after $i min — its run syncs instead:"
+              echo "$paths" | head -5
+              echo "superseded=true" >> "$GITHUB_OUTPUT"
+              {
+                echo "### Oppdatering av testversjoner"
+                echo ""
+                echo "Utsatt — en nyere publisering oppdaterer testversjonene i stedet."
+              } >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+          done
+          echo "no newer publish in $MINUTES min — syncing"
+
   sync-open-prs:
+    needs: debounce
+    if: needs.debounce.outputs.superseded != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     # Two quick merges to the base must not sync the same branches at once;
