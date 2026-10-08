@@ -40,6 +40,11 @@ on:
         type: number
         default: 20
         description: "Wait this long before syncing, and stand down if a newer publish lands on the base meanwhile (its own run syncs instead). 0 syncs immediately, as before. Capped at 60."
+      idle_days:
+        required: false
+        type: number
+        default: 3
+        description: "Leave a PR alone when its newest own commit (not a sync merge, not a preview bump) is older than this many days — nobody is looking at that testversjon, and every sync rebuilds it. It is synced again on the first publish after someone pushes to it; /publish syncs before merging anyway. 0 syncs every PR, as before."
     # Declared explicitly, NOT read via `secrets: inherit`: inherit only works
     # when caller and called workflow are in the same org or enterprise, and
     # customer app repos call this cross-org. Callers must map these:
@@ -183,6 +188,7 @@ jobs:
           GH_TOKEN: ${{ steps.app_token.outputs.token || github.token }}
           BASE: ${{ inputs.base_branch || github.ref_name }}
           SKIP_LABEL: ${{ inputs.skip_label }}
+          IDLE_DAYS: ${{ inputs.idle_days }}
           MARKER: "<!-- logisk-sync-main -->"
           # Customer-facing (commit shows up in the PR timeline): plain
           # Norwegian, no branch/merge vocabulary.
@@ -256,9 +262,21 @@ jobs:
             return 1
           }
 
+          # last_work <branch> → commit time (epoch) of the newest commit that is
+          # the branch's own work: not on the base, not a merge (our sync merges
+          # and the assistant's conflict merges), not a preview-manifest bump.
+          # 0 if there is none. Assumes origin/$BASE and origin/<branch> are fetched.
+          last_work() {
+            git log "origin/$BASE..origin/$1" --no-merges --format='%ct%x09%an%x09%s' \
+              | awk -F'\t' '!found && $2 != "manifest-bot" && $3 !~ /^bump preview/ { print $1; found = 1 }' \
+              | grep . || echo 0
+          }
+
           SYNCED=0
           CONFLICTED=0
           FAILED=0
+          IDLE=0
+          NOW=$(date +%s)
           : > /tmp/summary.md
 
           gh pr list --repo "$GITHUB_REPOSITORY" --state open \
@@ -280,6 +298,16 @@ jobs:
               echo "#$NUM ($BRANCH): skipped — carries the '$SKIP_LABEL' label"
               printf -- '- *%s*: satt på vent\n' "$TITLE" >> /tmp/summary.md
               continue
+            fi
+            if [ "$IDLE_DAYS" -gt 0 ] && git fetch --quiet origin "$BASE" "$BRANCH" 2>/dev/null; then
+              last=$(last_work "$BRANCH")
+              if [ $(( NOW - last )) -gt $(( IDLE_DAYS * 86400 )) ]; then
+                if [ "$last" -gt 0 ]; then since=$(date -u -d "@$last" +%Y-%m-%d); else since="never"; fi
+                echo "#$NUM ($BRANCH): skipped — idle, last own commit $since (idle_days=$IDLE_DAYS)"
+                printf -- '- *%s*: ikke oppdatert nå — ingen endringer på over %s dager. Oppdateres når noen jobber videre med den.\n' "$TITLE" "$IDLE_DAYS" >> /tmp/summary.md
+                IDLE=$((IDLE + 1))
+                continue
+              fi
             fi
             echo "#$NUM ($BRANCH):"
 
