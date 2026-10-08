@@ -17,4 +17,4 @@
 - **Severity:** bug (prod)
 - **What:** Two publishes 3 min apart (2026-10-05 11:31, 11:34): prod was bumped to `main-32d62dd` and then to `main-9ca02e7` 73 s later, so `main-32d62dd` was never served. verify-prod waited 10 min for it, timed out, and tried to pin prod back to `main-cde0b7c`, two versions older, over the newer good release. Only a rebase conflict on the rollback push stopped it.
 - **Suggested fix:** Before waiting or rolling back, re-read the prod manifest. If `newTag` is no longer `expect_tag`, a newer publish owns prod: pass as superseded, never roll back.
-- **Fixed:** 2026-10-06, commit 4f4a9a7
+- **Fixed:** 2026-10-08, logiskbrist/logisk-platform-workflows#10
