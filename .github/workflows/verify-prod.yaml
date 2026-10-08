@@ -74,7 +74,7 @@ on:
         required: false
     outputs:
       result:
-        description: "ok | failed | rolled_back"
+        description: "ok | failed | rolled_back | superseded (a newer publish took over prod before this one was verified)"
         value: ${{ jobs.verify-prod.outputs.result }}
       url:
         description: "The production base URL that was verified."
@@ -123,6 +123,37 @@ jobs:
           # Credentials are persisted by checkout, so the rollback push below
           # uses this token — the App is the ruleset bypass actor for main.
           token: ${{ steps.app_token.outputs.token || github.token }}
+
+      # Two publishes minutes apart: the newer one bumps the prod manifest
+      # before this one's tag is ever served. Waiting for our tag would time
+      # out, and rolling back would pin prod to an OLDER tag on top of the
+      # newer release (godtbrod/deigverkstedet, 2026-10-05: 32d62dd was bumped
+      # over by 9ca02e7 73 s later, and verify-prod tried to restore cde0b7c).
+      # So both the wait loop and the rollback re-read the manifest on the
+      # default branch: once it no longer says expect_tag, a newer publish (or
+      # a person) owns prod and this run stands down — its own verify-prod
+      # covers the newer tag.
+      - name: write manifest-tag helper
+        env:
+          IMAGE_NAME: ${{ inputs.image_name }}
+          MANIFEST: ${{ inputs.manifest_path }}
+          BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/prod-tag.sh" <<'EOF'
+          #!/usr/bin/env bash
+          # Needs BRANCH, MANIFEST and IMAGE_NAME in the calling step's env.
+          # Prints the prod image tag currently on origin/$BRANCH, or nothing on error.
+          git fetch --quiet origin "$BRANCH" 2>/dev/null || exit 0
+          if [ -n "$IMAGE_NAME" ]; then
+            git show "origin/$BRANCH:$MANIFEST" 2>/dev/null \
+              | yq -r '.images[] | select(.name == strenv(IMAGE_NAME)) | .newTag' 2>/dev/null || true
+          else
+            git show "origin/$BRANCH:$MANIFEST" 2>/dev/null \
+              | sed -n 's/^[[:space:]]*newTag:[[:space:]]*//p' | head -1 | tr -d "\"'" || true
+          fi
+          EOF
+          chmod +x "$RUNNER_TEMP/prod-tag.sh"
 
       # A brand-new app has nothing to verify yet: the platform only discovers a
       # repo once it carries the `logisk-platform` topic, which /new-app adds AFTER
@@ -196,6 +227,9 @@ jobs:
           HEALTH_PATH: ${{ inputs.health_path }}
           EXPECT_TAG: ${{ inputs.expect_tag }}
           TIMEOUT_MINUTES: ${{ inputs.timeout_minutes }}
+          IMAGE_NAME: ${{ inputs.image_name }}
+          MANIFEST: ${{ inputs.manifest_path }}
+          BRANCH: ${{ github.event.repository.default_branch }}
         run: |
           set -euo pipefail
           HEALTH_URL="${BASE_URL}${HEALTH_PATH}"
@@ -243,6 +277,16 @@ jobs:
               echo "Health $code, retrying ..."
             fi
 
+            # A newer publish (or a person) has re-pointed prod: stand down.
+            # Empty means the read failed — keep waiting rather than guess.
+            prod_tag=$("$RUNNER_TEMP/prod-tag.sh")
+            if [ -n "$prod_tag" ] && [ "$prod_tag" != "$EXPECT_TAG" ]; then
+              printf 'superseded=%s\n' "$prod_tag" >> "$GITHUB_OUTPUT"
+              printf 'ok=true\n' >> "$GITHUB_OUTPUT"
+              echo "::notice::Prod manifest now points at $prod_tag, not $EXPECT_TAG — a newer publish took over; its own verify-prod checks it. Standing down, no rollback."
+              exit 0
+            fi
+
             if [ "$(date +%s)" -ge "$deadline" ]; then
               fail "helsesjekk" "Timed out waiting for ${HEALTH_URL} to serve tag ${EXPECT_TAG} (last HTTP ${code})."
             fi
@@ -282,40 +326,56 @@ jobs:
         if: steps.first.outputs.skip != 'true' && (steps.plan.outputs.do_rollback == 'true')
         env:
           PREVIOUS_TAG: ${{ inputs.previous_tag }}
+          EXPECT_TAG: ${{ inputs.expect_tag }}
           IMAGE_NAME: ${{ inputs.image_name }}
           MANIFEST: ${{ inputs.manifest_path }}
           BRANCH: ${{ github.event.repository.default_branch }}
         run: |
           set -euo pipefail
-
-          if [ -n "$IMAGE_NAME" ]; then
-            yq -i '(.images[] | select(.name == strenv(IMAGE_NAME)) | .newTag) = strenv(PREVIOUS_TAG)' "$MANIFEST"
-          else
-            sed -i "s|newTag: .*|newTag: $PREVIOUS_TAG|" "$MANIFEST"
-          fi
-
           git config user.email "manifest-bot@logiskbrist.no"
           git config user.name "manifest-bot"
-          git add "$MANIFEST"
-          if git diff --cached --quiet; then
-            echo "::notice::prod manifest is already at $PREVIOUS_TAG, nothing to push."
-            exit 0
-          fi
-          git commit -m "rollback: pin prod image to $PREVIOUS_TAG (verify-prod failed)"
 
-          attempts=0
-          until git push origin "HEAD:$BRANCH"; do
-            attempts=$((attempts + 1))
-            if [ $attempts -ge 3 ]; then
-              echo "::error::rollback push to $BRANCH failed after 3 attempts"
+          # Every attempt starts from the fresh tip and re-checks who owns prod.
+          # Never `pull --rebase` the rollback commit: replayed onto a newer
+          # bump it would pin prod to an older tag over a newer release.
+          for attempt in 1 2 3; do
+            git fetch --quiet origin "$BRANCH"
+            git reset --quiet --hard "origin/$BRANCH"
+
+            prod_tag=$("$RUNNER_TEMP/prod-tag.sh")
+            if [ -z "$prod_tag" ]; then
+              echo "::error::could not read the prod tag from $MANIFEST on $BRANCH — not rolling back blind."
               exit 1
             fi
-            echo "push rejected, rebasing and retrying (attempt $attempts)..."
-            git pull --rebase origin "$BRANCH"
+            if [ "$prod_tag" != "$EXPECT_TAG" ]; then
+              echo "::notice::Prod manifest points at $prod_tag, not $EXPECT_TAG — a newer publish took over. Not rolling back."
+              printf 'superseded=%s\n' "$prod_tag" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+
+            if [ -n "$IMAGE_NAME" ]; then
+              yq -i '(.images[] | select(.name == strenv(IMAGE_NAME)) | .newTag) = strenv(PREVIOUS_TAG)' "$MANIFEST"
+            else
+              sed -i "s|newTag: .*|newTag: $PREVIOUS_TAG|" "$MANIFEST"
+            fi
+            git add "$MANIFEST"
+            if git diff --cached --quiet; then
+              echo "::notice::prod manifest is already at $PREVIOUS_TAG, nothing to push."
+              exit 0
+            fi
+            git commit --quiet -m "rollback: pin prod image to $PREVIOUS_TAG (verify-prod failed)"
+
+            if git push origin "HEAD:$BRANCH"; then
+              printf 'pushed=true\n' >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            echo "push rejected (attempt $attempt/3), refetching and re-checking ..."
           done
+          echo "::error::rollback push to $BRANCH failed after 3 attempts"
+          exit 1
 
       - name: open a rollback issue
-        if: steps.first.outputs.skip != 'true' && (always() && steps.rollback.outcome == 'success')
+        if: steps.first.outputs.skip != 'true' && (always() && steps.rollback.outputs.pushed == 'true')
         continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
@@ -357,7 +417,9 @@ jobs:
         env:
           OK: ${{ steps.verify.outputs.ok }}
           REPORTS_TAG: ${{ steps.verify.outputs.reports_tag }}
-          ROLLED_BACK: ${{ steps.rollback.outcome }}
+          ROLLED_BACK: ${{ steps.rollback.outputs.pushed }}
+          SUPERSEDED: ${{ steps.verify.outputs.superseded || steps.rollback.outputs.superseded }}
+          EXPECT_TAG: ${{ inputs.expect_tag }}
           BASE_URL: ${{ steps.cfg.outputs.url }}
         run: |
           set -euo pipefail
@@ -365,6 +427,20 @@ jobs:
             echo "### Publisering"
             echo ""
           } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ -n "$SUPERSEDED" ]; then
+            {
+              echo "- En nyere publisering ble satt i drift før denne ble kontrollert, så den kontrolleres i stedet. Ingenting er satt tilbake."
+              echo ""
+              echo "<details><summary>Detaljer</summary>"
+              echo ""
+              echo "Prod manifest moved from \`$EXPECT_TAG\` to \`$SUPERSEDED\` before verification finished; that publish's verify-prod covers it."
+              echo ""
+              echo "</details>"
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "result=superseded" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
 
           if [ "$OK" = "true" ]; then
             {
@@ -381,7 +457,7 @@ jobs:
             exit 0
           fi
 
-          if [ "$ROLLED_BACK" = "success" ]; then
+          if [ "$ROLLED_BACK" = "true" ]; then
             {
               echo "- ✗ Appen svarte ikke slik den skulle etter publiseringen."
               echo "- ✓ Appen er satt tilbake til forrige versjon."
