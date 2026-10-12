@@ -22,6 +22,13 @@ name: sync-open-prs
 # in the meantime — that publish's own run does the sync instead. A burst of
 # publishes costs one sync round, not one per publish. On godtbrod/deigverkstedet
 # sync commits were 77% of all builds before this (Sept 2026).
+#
+# The wait itself bills a runner, so it only happens when it can pay off: the
+# `debounce` job first counts the PRs the sync would touch (open, not held, not
+# idle). None → no wait and no sync. Fewer than `debounce_min_prs` → sync at
+# once. Only from there does it wait. (Oct 2026, before this rule: the flat
+# 20-min wait was the single most expensive job in some repos, e.g.
+# agentplattform 465 min waiting vs 19 syncing over five days.)
 on:
   workflow_call:
     inputs:
@@ -40,6 +47,11 @@ on:
         type: number
         default: 20
         description: "Wait this long before syncing, and stand down if a newer publish lands on the base meanwhile (its own run syncs instead). 0 syncs immediately, as before. Capped at 60."
+      debounce_min_prs:
+        required: false
+        type: number
+        default: 4
+        description: "Only wait when at least this many PRs would actually be synced (open, not held, not idle). Fewer, and the sync round is cheaper than the wait, so it syncs at once; none, and it skips the sync entirely. 0 always waits."
       idle_days:
         required: false
         type: number
@@ -95,11 +107,68 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           MINUTES: ${{ inputs.debounce_minutes }}
+          MIN_PRS: ${{ inputs.debounce_min_prs }}
+          IDLE_DAYS: ${{ inputs.idle_days }}
+          SKIP_LABEL: ${{ inputs.skip_label }}
           BASE: ${{ inputs.base_branch || github.ref_name }}
           OURS: ${{ github.sha }}
         run: |
           set -uo pipefail
           echo "superseded=false" >> "$GITHUB_OUTPUT"
+
+          # The wait bills a runner minute per minute; a sync round bills
+          # roughly 9 per PR it syncs (rebuild + PR checks). With the idle skip
+          # most rounds touch only a few PRs, and a flat 20-min wait on every
+          # publish in every repo cost more than it saved (Oct 2026:
+          # deigverkstedet 236 min waiting vs 9 syncing in a day). So count the
+          # PRs the sync step would actually touch — same rules: open, same
+          # repo, not held, newest own commit (not a merge, not a manifest-bot
+          # bump) within idle_days — and only wait when there are enough.
+          # GraphQL: one call for all PRs. A failed query counts as "unknown"
+          # and keeps the old behaviour (wait, then sync).
+          # shellcheck disable=SC2016 # $owner/$name are GraphQL variables, not shell
+          ACTIVE=$(gh api graphql -F owner="${GITHUB_REPOSITORY%/*}" -F name="${GITHUB_REPOSITORY#*/}" -f query='
+            query($owner: String!, $name: String!) {
+              repository(owner: $owner, name: $name) {
+                pullRequests(states: OPEN, first: 100) {
+                  nodes {
+                    isCrossRepository headRefName
+                    labels(first: 20) { nodes { name } }
+                    commits(last: 100) { nodes { commit {
+                      committedDate messageHeadline
+                      author { name } parents { totalCount }
+                    } } }
+                  }
+                }
+              }
+            }' --jq "
+              [.data.repository.pullRequests.nodes[]
+               | select(.isCrossRepository | not)
+               | select(.headRefName != \"$BASE\")
+               | select([.labels.nodes[].name] | index(\"$SKIP_LABEL\") | not)
+               | ([.commits.nodes[].commit
+                   | select(.parents.totalCount < 2)
+                   | select((.author.name // \"\") != \"manifest-bot\")
+                   | select(.messageHeadline | startswith(\"bump preview\") | not)
+                   | .committedDate | fromdateiso8601] | max // 0) as \$last
+               | select($IDLE_DAYS == 0 or (now - \$last) <= ($IDLE_DAYS * 86400))
+              ] | length") || ACTIVE=""
+          echo "PRs the sync would touch: ${ACTIVE:-unknown}"
+          if [ "$ACTIVE" = "0" ]; then
+            echo "no active PRs — nothing to sync"
+            echo "superseded=true" >> "$GITHUB_OUTPUT"
+            {
+              echo "### Oppdatering av testversjoner"
+              echo ""
+              echo "Ingen aktive testversjoner å oppdatere."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          if [ -n "$ACTIVE" ] && [ "$MIN_PRS" -gt 0 ] && [ "$ACTIVE" -lt "$MIN_PRS" ]; then
+            echo "$ACTIVE active PR(s), below debounce_min_prs=$MIN_PRS — a sync round is cheaper than the wait, syncing now"
+            exit 0
+          fi
+
           if [ "$MINUTES" -le 0 ]; then
             echo "debounce disabled — syncing now"
             exit 0
