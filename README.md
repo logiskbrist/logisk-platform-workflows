@@ -18,7 +18,7 @@ Reusable GitHub Actions workflows for customer apps deployed on Logiskbrist's AK
 | `.github/workflows/lb-review-gate.yaml` | The Logisk Brist review gate for critical apps — holds a sensitive change until the reviewer team approves. No-op on apps that are not marked critical. Outputs `critical`, `sensitive`, `approved`, `reasons`. |
 | `.github/workflows/sync-open-prs.yaml` | After each push to the default branch, merge it into every open PR branch (App-token push, so the branch rebuilds and its preview redeploys). Conflicts confined to `manifests/preview/**` are resolved with the branch's own version; any other conflict aborts the merge and upserts one sticky Norwegian comment on the PR — nothing is ever forced. PRs labeled `hold-oppdatering` (input `skip_label`) are left alone entirely. Debounced: waits `debounce_minutes` (default 20) and stands down if a newer publish lands meanwhile, so a burst of publishes costs one sync round; it only waits when at least `debounce_min_prs` (default 4) PRs would be synced, and skips entirely when none would. PRs with no own commit in `idle_days` (default 3) are skipped. Outputs `synced`, `conflicted` (empty when it stood down). |
 | `.github/workflows/open-draft-pr.yaml` | On any non-main branch push, open a draft PR to main via a **GitHub App token** (not `GITHUB_TOKEN`) so the resulting PR triggers `build`. Idempotent. Outputs `pr_number`. |
-| `.github/workflows/set-secret.yaml` | Write a secret to the customer's Key Vault under the naming convention `<app>-{prod,preview}-<KEY-with-hyphens>`. Uses OIDC to Azure; value is masked in logs. |
+| `.github/workflows/set-secret.yaml` | Write a secret to the customer's Key Vault under the naming convention `<app>-{prod,preview}-<KEY-with-hyphens>`. Uses OIDC to Azure. Pass the value under `secrets: value:` — a value passed under `with:` is printed in clear text in the run log (see below). |
 | `.github/workflows/delete-secret.yaml` | Mirror of `set-secret` — `az keyvault secret delete`. |
 | `.github/workflows/list-secrets.yaml` | Lists env-var names scoped to the calling app. Values never printed. Output goes to both the run's Markdown summary and stdout with `PROD_SECRETS_{START,END}` markers for AI parsing. |
 | `.github/workflows/example-caller.yaml` | Not reusable — copy this file into a customer app repo at `.github/workflows/build.yaml`. |
@@ -74,6 +74,10 @@ All reusable workflow inputs default to these names, so a caller usually needs n
       azure_tenant_id: ${{ vars.LOGISK_AZURE_TENANT_ID }}
       azure_subscription_id: ${{ vars.LOGISK_AZURE_SUBSCRIPTION_ID }}
       keyvault_name: ${{ vars.LOGISK_KEYVAULT_NAME }}
+      name: ${{ inputs.name }}
+      preview: ${{ inputs.preview }}
+    secrets:
+      value: ${{ inputs.value }}   # NOT under with: — inputs are printed in clear text in the run log
 ```
 
 (`ai-review` / `lb-review-gate` additionally take `ANTHROPIC_API_KEY` in the secrets map.) The App ID + installation ID must also exist as org **secrets** (they do on current customer orgs), since org variables never reach the reusable workflows. See the `example-*.yaml` files — they show the full pattern.
