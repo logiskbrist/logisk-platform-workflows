@@ -8,6 +8,7 @@ Reusable GitHub Actions workflows for customer apps deployed on Logiskbrist's AK
 
 | File | Purpose |
 |---|---|
+| `.github/workflows/run-migration.yaml` | Request a reviewed SQL migration inside the customer platform using GitHub OIDC; no database or cluster credentials on GitHub. Requires dispatcher registration and the protected `production-migrations` environment. See [setup and execution contract](migrations/README.md). |
 | `.github/workflows/build-and-push.yaml` | Build the customer app's Docker image; tag as `main-<sha>` on main pushes and `pr-<N>-<sha>` on PRs; push to GHCR under the calling repo's namespace. Optional `context`, `dockerfile`, `image_suffix` inputs for monorepos with multiple services. |
 | `.github/workflows/update-prod-manifest.yaml` | Bump `manifests/prod/kustomization.yaml`'s image tag and push back to main **with the GitHub App token**. Pass `image_name` to scope the bump to one entry in a multi-image manifest. Outputs `previous_tag` (the tag before the bump — feed it to `verify-prod` for rollback) and `image_tag`. |
 | `.github/workflows/update-preview-manifest.yaml` | Same, but bumps `manifests/preview/kustomization.yaml` on the PR head branch, also with the App token. Same `previous_tag` / `image_tag` outputs. |

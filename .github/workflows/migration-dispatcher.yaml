@@ -1,0 +1,44 @@
+name: migration-dispatcher
+on:
+  pull_request:
+    paths: ['migrations/**', '.github/workflows/run-migration.yaml', '.github/workflows/migration-dispatcher.yaml']
+  push:
+    branches: [main]
+    paths: ['migrations/**', '.github/workflows/run-migration.yaml', '.github/workflows/migration-dispatcher.yaml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: migrations/go.mod
+          cache: false
+      - run: go test -race -p 1 ./... && go vet ./...
+        working-directory: migrations
+        env:
+          MIGRATION_POSTGRES_TEST: '1'
+  image:
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: migrations
+          push: true
+          tags: ghcr.io/logiskbrist/platform-migration-dispatcher:${{ github.sha }}
