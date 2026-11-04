@@ -119,3 +119,7 @@ the service are separate rollout steps; implementing this feature performs none
 of those operations automatically.
 
 OIDC claim contract: [GitHub's reference](https://docs.github.com/en/actions/reference/security/oidc).
+
+The lock script uses a named PostgreSQL dollar-quote tag: Kubernetes expands
+`$$` to `$` in container command arguments before the shell sees them. The
+Postgres integration test reproduces this expansion before executing the runner.
