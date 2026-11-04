@@ -1,0 +1,133 @@
+name: run-migration
+
+on:
+  workflow_call:
+    inputs:
+      file:
+        description: SQL file under script/engangs/ at the calling run's commit.
+        required: true
+        type: string
+      database:
+        description: Optional assertion; the dispatcher derives the database from repository identity.
+        required: false
+        default: ''
+        type: string
+      endpoint:
+        description: HTTPS origin of the customer's migration dispatcher. Pass the caller's LOGISK_MIGRATION_URL variable explicitly.
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  migrate:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # Configure required reviewers + prevent self-review before enabling the
+    # dispatcher registration. Branch previews still target production.
+    environment: production-migrations
+    concurrency:
+      group: production-migration-${{ github.repository_id }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Request and follow the migration
+        env:
+          MIGRATION_FILE: ${{ inputs.file }}
+          MIGRATION_DATABASE: ${{ inputs.database }}
+          MIGRATION_ENDPOINT: ${{ inputs.endpoint }}
+        shell: python
+        run: |
+          import hashlib, json, os, pathlib, re, sys, time, urllib.error, urllib.parse, urllib.request, uuid
+
+          class NoRedirect(urllib.request.HTTPRedirectHandler):
+              def redirect_request(self, *args, **kwargs):
+                  return None
+
+          http = urllib.request.build_opener(NoRedirect())
+          endpoint = os.environ['MIGRATION_ENDPOINT'].rstrip('/')
+          if not re.fullmatch(r'https://[a-z0-9]+(?:[a-z0-9.-]*[a-z0-9])?', endpoint):
+              sys.exit('Configure LOGISK_MIGRATION_URL as an HTTPS origin before running migrations.')
+          file = os.environ['MIGRATION_FILE']
+          root = pathlib.Path(os.environ['GITHUB_WORKSPACE']).resolve()
+          candidate = root / file
+          if (not re.fullmatch(r'script/engangs/[A-Za-z0-9_./-]+\.sql', file)
+                  or '..' in file or str(pathlib.PurePosixPath(file)) != file
+                  or candidate.resolve() != candidate.absolute()
+                  or not candidate.is_file()):
+              sys.exit('Choose a regular SQL file under script/engangs/; symlinks and traversal are forbidden.')
+          with candidate.open('rb') as source:
+              raw = source.read(262145)
+          if not 0 < len(raw) <= 262144 or b'\\' in raw or b'\0' in raw:
+              sys.exit('SQL must be 1–262144 bytes without backslashes or NUL; psql commands are forbidden.')
+          sql = raw.decode('utf-8')
+          checksum = hashlib.sha256(raw).hexdigest()
+          payload = json.dumps({'file': file, 'sql': sql, 'database': os.environ['MIGRATION_DATABASE']}).encode()
+
+          def identity():
+              url = os.environ['ACTIONS_ID_TOKEN_REQUEST_URL']
+              url += ('&' if '?' in url else '?') + urllib.parse.urlencode({'audience': endpoint})
+              req = urllib.request.Request(url, headers={'Authorization': 'Bearer ' + os.environ['ACTIONS_ID_TOKEN_REQUEST_TOKEN']})
+              with http.open(req, timeout=20) as response:
+                  token = json.load(response)['value']
+              print('::add-mask::' + token, flush=True)
+              return token
+
+          def request(method, body=None):
+              req = urllib.request.Request(endpoint + '/migration', data=body, method=method,
+                  headers={'Authorization': 'Bearer ' + identity(), 'Content-Type': 'application/json'})
+              with http.open(req, timeout=30) as response:
+                  return json.load(response)
+
+          # A lost POST response must never cause a second SQL execution. The
+          # dispatcher identifies jobs by repository ID + run ID, across reruns.
+          dispatched = None
+          for attempt in range(3):
+              try:
+                  dispatched = request('POST', payload)
+                  break
+              except urllib.error.HTTPError as error:
+                  if error.code not in (409, 429, 502, 503, 504) or attempt == 2:
+                      sys.exit(f'Migration dispatch refused (HTTP {error.code}). See the platform operator for details.')
+              except (urllib.error.URLError, TimeoutError):
+                  if attempt == 2:
+                      sys.exit('Migration dispatch response unavailable. Rerun this same GitHub run to inspect its original job.')
+              time.sleep(3)
+          if dispatched['sha256'] != checksum:
+              sys.exit('Dispatcher returned a different SQL checksum.')
+          print(f'Migration job: {dispatched["job"]}; SQL SHA-256: {checksum}', flush=True)
+          deadline = time.monotonic() + 1020
+          result = None
+          while time.monotonic() < deadline:
+              try:
+                  result = request('GET')
+              except urllib.error.HTTPError as error:
+                  if error.code not in (429, 502, 503, 504):
+                      sys.exit(f'Migration status unavailable (HTTP {error.code}); execution may still be running.')
+                  time.sleep(10)
+                  continue
+              except (urllib.error.URLError, TimeoutError):
+                  time.sleep(10)
+                  continue
+              if result['state'] in ('succeeded', 'failed'):
+                  break
+              time.sleep(10)
+          if result is None or result['state'] not in ('succeeded', 'failed'):
+              sys.exit('Timed out following migration. Rerun this same GitHub run to inspect it; do not dispatch another run blindly.')
+          # SQL output is untrusted and may contain GitHub workflow commands.
+          marker = str(uuid.uuid4())
+          print('::stop-commands::' + marker, flush=True)
+          print(result.get('logs', ''), flush=True)
+          print('::' + marker + '::', flush=True)
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as summary:
+              summary.write(f'### Databaseendring\n\nResultat: {result["state"]}\n\n')
+              summary.write(f'Fil: `{file}`\n\nCommit: `{os.environ["GITHUB_SHA"]}`\n\nSHA-256: `{checksum}`\n\nJobb: `{dispatched["job"]}`\n')
+          if result['state'] != 'succeeded':
+              sys.exit('Migration failed. Inspect the log before starting a new run; SQL is never retried automatically.')
