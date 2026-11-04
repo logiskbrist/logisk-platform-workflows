@@ -53,7 +53,9 @@ func TestPostgresRunner(t *testing.T) {
 	migration := func(sql, db string) (string, error) {
 		count++
 		dir := fmt.Sprintf("/tmp/migration-%d", count)
-		script := "mkdir -p " + dir + "\n" + strings.ReplaceAll(runnerScript, "/work", dir)
+		// Kubernetes expands $$ to $ in command/args before starting the shell.
+		// Docker exec alone does not reproduce that deployment boundary.
+		script := "mkdir -p " + dir + "\n" + strings.ReplaceAll(strings.ReplaceAll(runnerScript, "$$", "$"), "/work", dir)
 		args := []string{"exec"}
 		for _, pair := range sqlEnvironment(sql) {
 			args = append(args, "-e", pair[0]+"="+pair[1])

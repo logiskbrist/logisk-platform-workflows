@@ -170,11 +170,11 @@ printf '%s' "$MIGRATION_SQL_0" "$MIGRATION_SQL_1" "$MIGRATION_SQL_2" "$MIGRATION
 cat > /work/lock.sql <<'SQL'
 SET statement_timeout = '10min';
 SET lock_timeout = '15s';
-DO $$ BEGIN
+DO $migration_lock$ BEGIN
  IF NOT pg_try_advisory_lock(731041, 1) THEN
   RAISE EXCEPTION 'Another migration is running for this database';
  END IF;
-END $$;
+END $migration_lock$;
 SQL
 unset MIGRATION_SQL_0 MIGRATION_SQL_1 MIGRATION_SQL_2 MIGRATION_SQL_3 MIGRATION_SQL_4 MIGRATION_SQL_5
 exec psql -X --no-password --set=ON_ERROR_STOP=1 --set=VERBOSITY=terse --single-transaction --file=/work/lock.sql --file=/work/migration.sql
